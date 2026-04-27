@@ -2324,6 +2324,117 @@ def get_btcd_bias() -> str:
         return "FLAT"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  MARKET REGIME DETECTOR — BTC + BTCD EMA Real-Time
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Logika sederhana & tegas:
+#   BULL_REGIME  : BTC EMA bullish + BTCD turun  → LONG ok, SHORT DIBLOK
+#   BEAR_REGIME  : BTC EMA bearish + BTCD naik   → SHORT ok, LONG DIBLOK
+#   NEUTRAL      : Kondisi lain                   → kedua arah boleh (ikut sinyal biasa)
+#
+# Deteksi pakai EMA (bukan swing) agar responsif terhadap crash/pump mendadak.
+# Cache 3 menit agar tidak overload API di setiap scan pair.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_regime_cache: dict = {"regime": "NEUTRAL", "reason": "", "ts": 0.0}
+_REGIME_CACHE_TTL = 180   # detik — refresh setiap 3 menit
+
+def get_market_regime() -> tuple:
+    """
+    Deteksi market regime dari BTC EMA + BTCD EMA secara real-time.
+
+    Return: (regime: str, reason: str, block_long: bool, block_short: bool)
+      regime  : 'BULL_REGIME' | 'BEAR_REGIME' | 'NEUTRAL'
+      reason  : penjelasan singkat untuk log
+      block_long  : True jika semua sinyal LONG harus diblok
+      block_short : True jika semua sinyal SHORT harus diblok
+    """
+    global _regime_cache
+    now = time.time()
+
+    # Return cache jika masih valid
+    if (now - _regime_cache["ts"]) < _REGIME_CACHE_TTL:
+        r = _regime_cache
+        return r["regime"], r["reason"], r["block_long"], r["block_short"]
+
+    regime     = "NEUTRAL"
+    reason     = "BTC/BTCD kondisi campuran — kedua arah diizinkan"
+    block_long  = False
+    block_short = False
+
+    try:
+        # ── Fetch BTC LTF (1h, 60 candle) untuk EMA direction ────────────────
+        df_btc = fetch_ohlcv("BTC/USDT", "1h", limit=60)
+        if df_btc is None or len(df_btc) < 30:
+            raise ValueError("BTC data tidak cukup")
+
+        closes_btc = df_btc["close"].astype(float)
+        btc_ema9   = float(closes_btc.ewm(span=9,  adjust=False).mean().iloc[-1])
+        btc_ema21  = float(closes_btc.ewm(span=21, adjust=False).mean().iloc[-1])
+        btc_price  = float(closes_btc.iloc[-1])
+
+        # BTC bullish: harga di atas EMA9 dan EMA9 di atas EMA21
+        btc_bullish = (btc_price > btc_ema9) and (btc_ema9 > btc_ema21)
+        # BTC bearish: harga di bawah EMA9 dan EMA9 di bawah EMA21
+        btc_bearish = (btc_price < btc_ema9) and (btc_ema9 < btc_ema21)
+
+        # ── Fetch BTCD LTF untuk EMA direction ───────────────────────────────
+        df_btcd = fetch_btcd_ohlcv(tf=BTCDOM_LTF_TF, limit=60)
+        btcd_rising  = False
+        btcd_falling = False
+
+        if df_btcd is not None and len(df_btcd) >= 20:
+            closes_btcd  = df_btcd["close"].astype(float)
+            btcd_ema9    = float(closes_btcd.ewm(span=9,  adjust=False).mean().iloc[-1])
+            btcd_ema21   = float(closes_btcd.ewm(span=21, adjust=False).mean().iloc[-1])
+            btcd_price   = float(closes_btcd.iloc[-1])
+            btcd_rising  = (btcd_price > btcd_ema9)  and (btcd_ema9  > btcd_ema21)
+            btcd_falling = (btcd_price < btcd_ema9)  and (btcd_ema9  < btcd_ema21)
+
+        # ── Tentukan regime ───────────────────────────────────────────────────
+        if btc_bullish and btcd_falling:
+            # BTC naik + Dominance turun = Alt season → LONG optimal, SHORT diblok
+            regime      = "BULL_REGIME"
+            block_short = True
+            reason      = (
+                f"🟢 BULL REGIME: BTC EMA bullish (price={btc_price:.0f} > EMA9={btc_ema9:.0f} > EMA21={btc_ema21:.0f}) "
+                f"+ BTCD EMA turun → Alt season → SHORT alt DIBLOK"
+            )
+
+        elif btc_bearish and btcd_rising:
+            # BTC turun + Dominance naik = Alt bleeding → SHORT optimal, LONG diblok
+            regime     = "BEAR_REGIME"
+            block_long = True
+            reason     = (
+                f"🔴 BEAR REGIME: BTC EMA bearish (price={btc_price:.0f} < EMA9={btc_ema9:.0f} < EMA21={btc_ema21:.0f}) "
+                f"+ BTCD EMA naik → Alt bleeding → LONG alt DIBLOK"
+            )
+
+        else:
+            # Kondisi campuran atau transisi → neutral, biarkan sinyal PA/SMC yang bicara
+            btc_state  = "BULLISH" if btc_bullish else ("BEARISH" if btc_bearish else "MIXED")
+            btcd_state = "RISING"  if btcd_rising  else ("FALLING" if btcd_falling  else "MIXED")
+            reason     = (
+                f"⚪ NEUTRAL: BTC EMA={btc_state}, BTCD EMA={btcd_state} "
+                f"— tidak ada kondisi dominan, semua arah diizinkan"
+            )
+
+    except Exception as e:
+        reason = f"⚠️ Regime error: {e} — fallback NEUTRAL"
+        print(f"  ⚠️  get_market_regime: {e}")
+
+    # Simpan ke cache
+    _regime_cache = {
+        "regime":      regime,
+        "reason":      reason,
+        "block_long":  block_long,
+        "block_short": block_short,
+        "ts":          now,
+    }
+    return regime, reason, block_long, block_short
+
+
 # ── Signal Hash — deduplikasi sinyal yang sama ───────────────────────────────
 _signal_hashes: dict = {}   # key: hash_str → expired_at (datetime)
 
@@ -9437,6 +9548,20 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             print(f"  ⏭  [{label}] {pair} {_dir_str} — difilter (hanya {_DIRECTION_FILTER})")
             return
 
+    # ── MARKET REGIME HARDBLOCK — BTC EMA + BTCD EMA ─────────────────────────
+    # Layer pertahanan paling awal, sebelum apapun diproses:
+    #   BULL_REGIME (BTC EMA↑ + BTCD EMA↓) → SHORT alt DIBLOK total
+    #   BEAR_REGIME (BTC EMA↓ + BTCD EMA↑) → LONG  alt DIBLOK total
+    # Tidak ada pengecualian. Cache 3 menit — tidak overload API.
+    _regime, _regime_reason, _regime_block_long, _regime_block_short = get_market_regime()
+    if _regime_block_long and trade_direction == "BULLISH":
+        print(f"  🚫 [{label}] {pair} LONG — REGIME BLOCK: {_regime_reason}")
+        return
+    if _regime_block_short and trade_direction == "BEARISH":
+        print(f"  🚫 [{label}] {pair} SHORT — REGIME BLOCK: {_regime_reason}")
+        return
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ─────────────────────────────────────────────────────────────────────────
     # Ref TF bonus
     # ─────────────────────────────────────────────────────────────────────────
@@ -10207,6 +10332,19 @@ def main():
             else:
                 btcd_trend = "FLAT"
                 print(f"🪙 BTC Bias ({BTC_BIAS_TF}): {btc_bias} | BTC.D: OFF")
+
+            # ── MARKET REGIME — log setiap scan (cache 3 menit, tidak overload API) ──
+            _mr, _mr_reason, _mr_bl, _mr_bs = get_market_regime()
+            _mr_icons = {
+                "BULL_REGIME": "🟢 BULL REGIME",
+                "BEAR_REGIME": "🔴 BEAR REGIME",
+                "NEUTRAL":     "⚪ NEUTRAL",
+            }
+            _mr_label = _mr_icons.get(_mr, "⚪ NEUTRAL")
+            _mr_block_str = ""
+            if _mr_bl:  _mr_block_str = " | ⛔ LONG DIBLOK"
+            if _mr_bs:  _mr_block_str = " | ⛔ SHORT DIBLOK"
+            print(f"📊 Market Regime: {_mr_label}{_mr_block_str}")
 
             # ── Kumpulkan semua kandidat sinyal dulu, baru filter & kirim ────
             signal_candidates = []
