@@ -6725,7 +6725,7 @@ def check_drawdown():
         msg = f"🛑 <b>BOT STOPPED</b>\nDrawdown limit {MAX_DRAWDOWN*100:.0f}% tercapai!"
         print("🛑 BOT STOPPED (DRAWDOWN LIMIT REACHED)")
         send_telegram_raw(msg)
-        exit()
+        raise SystemExit(0)
 
 
 def update_performance(pnl):
@@ -10525,10 +10525,12 @@ if __name__ == "__main__":
 
     try:
         main()
+    except SystemExit:
+        pass  # Clean shutdown (e.g. drawdown limit reached)
     except Exception as e:
         print("❌ ERROR:", e)
     finally:
         try:
             input("\nTekan ENTER untuk keluar...")
-        except (EOFError, OSError):
+        except (EOFError, OSError, ValueError):
             pass  # non-interactive environment (Docker, screen, nohup) — skip input prompt
