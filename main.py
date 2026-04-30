@@ -6298,16 +6298,26 @@ def manage_trailing():
                 # Kalau harga bounce cepat sebelum scan, price polling tidak cukup.
                 # Kita cek apakah TP1 order sudah tidak ada lagi di Binance
                 # (berarti sudah tereksekusi) meski harga saat ini sudah turun.
-                if not tp1_hit:
+                #
+                # GUARD: skip order-check dalam 60 detik pertama setelah entry.
+                # Saat baru entry, TP order belum tentu muncul di Binance (API delay).
+                # Tanpa guard ini → _no_tp_left=True + harga naik 0.2% → false TP1 hit.
+                _open_time   = pos.get("open_time")
+                _age_seconds = (datetime.now(timezone.utc) - _open_time).total_seconds() \
+                               if _open_time else 999
+                if not tp1_hit and _age_seconds >= 60:
                     try:
                         _open_ords = api_get("/fapi/v1/openOrders", {"symbol": symbol}, signed=True)
                         _tp_ords   = [o for o in _open_ords if o.get("type") in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT")]
                         # Kalau tidak ada TP order DAN posisi masih ada DAN trailing belum aktif
                         # → kemungkinan TP1 sudah kena (order tereksekusi, hanya TP2 tersisa)
-                        # Hanya trigger jika ada pergerakan profit (harga pernah melewati TP1 ke arah benar)
+                        # Threshold dinaikkan ke 80% dari jarak entry→TP1 agar tidak false-trigger
+                        # saat harga baru bergerak sedikit setelah entry.
                         _no_tp_left = len(_tp_ords) == 0
-                        _was_in_profit = (direction == "LONG" and price > entry * 1.002) or \
-                                         (direction == "SHORT" and price < entry * 0.998)
+                        _tp1_dist   = abs(tp1 - entry)
+                        _min_move   = _tp1_dist * 0.8  # harga harus sudah 80% menuju TP1
+                        _was_in_profit = (direction == "LONG" and price >= entry + _min_move) or \
+                                         (direction == "SHORT" and price <= entry - _min_move)
                         if _no_tp_left and _was_in_profit:
                             tp1_hit = True
                             print(f"  🔍 [{symbol}] tp1_hit via order-check (TP order hilang dari Binance)")
@@ -10538,7 +10548,7 @@ if __name__ == "__main__":
     try:
         main()
     except SystemExit:
-        pass  # Clean shutdown
+        pass  # Clean shutdown (e.g. drawdown limit reached)
     except Exception as e:
         print("❌ ERROR:", e)
     finally:
