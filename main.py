@@ -6716,16 +6716,26 @@ def send_hourly_position_report():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def check_drawdown():
+    global bot_paused, _daily_limit_state
     current = get_total_balance()
     start   = bot_state["balance_start"]
     if start == 0:
         return
     dd = (start - current) / start
     if dd >= MAX_DRAWDOWN:
-        msg = f"🛑 <b>BOT STOPPED</b>\nDrawdown limit {MAX_DRAWDOWN*100:.0f}% tercapai!"
-        print("🛑 BOT STOPPED (DRAWDOWN LIMIT REACHED)")
+        # Jangan exit() — cukup pause bot agar bisa di-resume via /start atau /resumeorpause
+        if _daily_limit_state.get("paused_by") == "DRAWDOWN":
+            return  # sudah di-pause sebelumnya, skip notif ulang
+        bot_paused = True
+        _daily_limit_state["paused_by"] = "DRAWDOWN"
+        msg = (
+            f"🛑 <b>DRAWDOWN LIMIT TERCAPAI — Bot Di-PAUSE</b>\n"
+            f"Drawdown: <b>{dd*100:.1f}%</b> (limit {MAX_DRAWDOWN*100:.0f}%)\n\n"
+            f"⏸ Bot otomatis PAUSE — tidak ada trade baru.\n"
+            f"Ketik /start atau /resumeorpause untuk melanjutkan secara manual."
+        )
+        print(f"⏸ BOT PAUSED (DRAWDOWN LIMIT REACHED: {dd*100:.1f}%)")
         send_telegram_raw(msg)
-        raise SystemExit(0)
 
 
 def update_performance(pnl):
@@ -7184,6 +7194,7 @@ def cmd_resumeorpause():
             f"Ketik /resumeorpause untuk melanjutkan."
         )
     else:
+        _daily_limit_state["paused_by"] = None  # reset agar limit/drawdown bisa re-trigger
         msg = (
             f"▶️ <b>Bot di-RESUME</b>\n"
             f"{'─'*30}\n"
@@ -7209,6 +7220,7 @@ def cmd_start():
         return
 
     bot_paused = False
+    _daily_limit_state["paused_by"] = None  # reset agar drawdown/limit bisa re-trigger jika perlu
 
     # ── Sync posisi BARU setelah user konfirmasi via /start ───────────────────
     # Ini sengaja ditunda dari startup agar tidak false-close posisi LIVE
@@ -10526,7 +10538,7 @@ if __name__ == "__main__":
     try:
         main()
     except SystemExit:
-        pass  # Clean shutdown (e.g. drawdown limit reached)
+        pass  # Clean shutdown
     except Exception as e:
         print("❌ ERROR:", e)
     finally:
