@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║  BOT AUTO TRADE — BINANCE LIVE × PRICE ACTION + S&D + S/R ENGINE        ║
+║  BOT AUTO TRADE — BINANCE LIVE × PA + S&D + S/R + BTC MULTI-TF ENGINE   ║
 ║                                                                          ║
 ║  SIGNAL METHOD:                                                          ║
 ║  ✅ HTF Trend Bias (4H/1D) — via swing high/low structure               ║
@@ -10,7 +10,11 @@
 ║  ✅ Scoring System (max 100+ pts) — fire at ≥ 60 pts (semua tier, hard minimum)║
 ║  ✅ Volume: gradasi 1.2x/1.5x/2x/3x confirmation                       ║
 ║  ✅ Session: London/New York +5pts | London-NY Overlap +8pts            ║
-║  ✅ Macro (BTC + BTC.D): scoring factor ONLY                            ║
+║  ✅ BTC Multi-TF: Daily→H4→H1 | Stoch RSI 5,3,3 | Divergence detect    ║
+║  ✅ BTC Gate: Daily RANGING → skip semua posisi (tidak ada setup)       ║
+║  ✅ BTC BULLISH → Long alt OK | BTC BEARISH → Short alt OK             ║
+║  ✅ BTCD naik + BTC bearish → Short OK (alt bleeding)                  ║
+║  ✅ Divergence H1/H4 BTC → bonus score entry timing                    ║
 ║  ✅ RR ≥ 1.5 required — Risk Management enforced                        ║
 ║  ✅ Multi-mode scan: INTRADAY (1d→1h) + SCALPING (4h→1h)               ║
 ║     LOW_TF: HTF 1h → entry 15m (RELAXED, sinyal lebih sering)          ║
@@ -2981,11 +2985,387 @@ def get_btcd_trend(df_btcd: Optional[pd.DataFrame]) -> str:
     return "FLAT"
 
 
-def get_btc_bias() -> str:
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  STOCHASTIC RSI ENGINE — Setting 5,3,3 (Digunakan untuk BTC Multi-TF)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def calc_stoch_rsi(df: pd.DataFrame, rsi_len: int = 5, stoch_len: int = 5,
+                   k_smooth: int = 3, d_smooth: int = 3) -> tuple:
+    """
+    Hitung Stochastic RSI dengan setting 5,3,3.
+    Return: (k_line: float, d_line: float)
+      k < 20   = Oversold zone
+      k > 80   = Overbought zone
+    """
+    if df is None or len(df) < rsi_len + stoch_len + k_smooth + d_smooth + 5:
+        return 50.0, 50.0
+
+    closes = df["close"].astype(float)
+
+    # ── Hitung RSI ─────────────────────────────────────────────────────────────
+    delta  = closes.diff()
+    gain   = delta.clip(lower=0)
+    loss   = -delta.clip(upper=0)
+    avg_g  = gain.ewm(com=rsi_len - 1, min_periods=rsi_len).mean()
+    avg_l  = loss.ewm(com=rsi_len - 1, min_periods=rsi_len).mean()
+    rs     = avg_g / avg_l.replace(0, 1e-9)
+    rsi    = 100 - (100 / (1 + rs))
+
+    # ── Hitung Stochastic dari RSI ─────────────────────────────────────────────
+    rsi_low  = rsi.rolling(stoch_len).min()
+    rsi_high = rsi.rolling(stoch_len).max()
+    raw_k    = 100 * (rsi - rsi_low) / (rsi_high - rsi_low + 1e-9)
+
+    # Smoothing K dan D
+    k_line   = raw_k.rolling(k_smooth).mean()
+    d_line   = k_line.rolling(d_smooth).mean()
+
+    k_val = float(k_line.iloc[-1]) if not k_line.empty else 50.0
+    d_val = float(d_line.iloc[-1]) if not d_line.empty else 50.0
+
+    if pd.isna(k_val): k_val = 50.0
+    if pd.isna(d_val): d_val = 50.0
+
+    return round(k_val, 2), round(d_val, 2)
+
+
+def get_stoch_rsi_state(k: float, d: float) -> str:
+    """
+    Terjemahkan nilai Stochastic RSI menjadi state kondisi pasar.
+    Return: 'OVERBOUGHT' | 'OVERSOLD' | 'NEUTRAL' | 'CROSSING_UP' | 'CROSSING_DOWN'
+    """
+    if k > 80 and d > 80:
+        return "OVERBOUGHT"
+    if k < 20 and d < 20:
+        return "OVERSOLD"
+    if k > 80 and k > d and d <= 80:
+        return "OVERBOUGHT"
+    if k < 20 and k < d and d >= 20:
+        return "OVERSOLD"
+    # Crossing patterns
+    if k > d and k < 50:
+        return "CROSSING_UP"
+    if k < d and k > 50:
+        return "CROSSING_DOWN"
+    return "NEUTRAL"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  DIVERGENCE DETECTOR — Bullish & Bearish untuk Konfirmasi Entry
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_divergence(df: pd.DataFrame, rsi_len: int = 5, stoch_len: int = 5,
+                       k_smooth: int = 3, d_smooth: int = 3,
+                       lookback: int = 30) -> str:
+    """
+    Deteksi Bullish / Bearish Divergence menggunakan Stochastic RSI (5,3,3).
+
+    Bullish Divergence: Harga buat Lower Low, Stoch RSI buat Higher Low
+      → sinyal potensi reversal naik (bagus untuk konfirmasi LONG)
+
+    Bearish Divergence: Harga buat Higher High, Stoch RSI buat Lower High
+      → sinyal potensi reversal turun (bagus untuk konfirmasi SHORT)
+
+    Return: 'BULLISH_DIV' | 'BEARISH_DIV' | 'NONE'
+    """
+    if df is None or len(df) < lookback + 10:
+        return "NONE"
+
+    closes = df["close"].astype(float)
+    highs  = df["high"].astype(float)
+    lows   = df["low"].astype(float)
+
+    # Hitung Stoch RSI untuk seluruh window
+    delta  = closes.diff()
+    gain   = delta.clip(lower=0)
+    loss   = -delta.clip(upper=0)
+    avg_g  = gain.ewm(com=rsi_len - 1, min_periods=rsi_len).mean()
+    avg_l  = loss.ewm(com=rsi_len - 1, min_periods=rsi_len).mean()
+    rs     = avg_g / avg_l.replace(0, 1e-9)
+    rsi    = 100 - (100 / (1 + rs))
+
+    rsi_low  = rsi.rolling(stoch_len).min()
+    rsi_high = rsi.rolling(stoch_len).max()
+    raw_k    = 100 * (rsi - rsi_low) / (rsi_high - rsi_low + 1e-9)
+    k_line   = raw_k.rolling(k_smooth).mean()
+
+    recent_df = df.iloc[-lookback:]
+    recent_k  = k_line.iloc[-lookback:]
+
+    # Cari swing lows (untuk bullish div) dan swing highs (untuk bearish div)
+    price_lows  = []
+    price_highs = []
+    k_lows      = []
+    k_highs     = []
+
+    window_sw = 3   # kecil untuk LTF, cukup untuk swing pivot
+    prices_l  = recent_df["low"].values
+    prices_h  = recent_df["high"].values
+    k_vals    = recent_k.values
+
+    for i in range(window_sw, len(prices_l) - window_sw):
+        # Swing low harga
+        if prices_l[i] == min(prices_l[i - window_sw: i + window_sw + 1]):
+            price_lows.append((i, prices_l[i]))
+        # Swing high harga
+        if prices_h[i] == max(prices_h[i - window_sw: i + window_sw + 1]):
+            price_highs.append((i, prices_h[i]))
+        # Swing low stoch RSI
+        if not pd.isna(k_vals[i]):
+            if k_vals[i] == min([v for v in k_vals[i - window_sw: i + window_sw + 1] if not pd.isna(v)] or [k_vals[i]]):
+                k_lows.append((i, k_vals[i]))
+            if k_vals[i] == max([v for v in k_vals[i - window_sw: i + window_sw + 1] if not pd.isna(v)] or [k_vals[i]]):
+                k_highs.append((i, k_vals[i]))
+
+    # ── Cek Bullish Divergence: Harga LL, Stoch RSI HL ───────────────────────
+    if len(price_lows) >= 2 and len(k_lows) >= 2:
+        # Bandingkan dua swing low terakhir
+        pl1_i, pl1_p = price_lows[-2]
+        pl2_i, pl2_p = price_lows[-1]
+        # Cari k_low terdekat dengan setiap swing low harga
+        kl1 = min(k_lows, key=lambda x: abs(x[0] - pl1_i), default=None)
+        kl2 = min(k_lows, key=lambda x: abs(x[0] - pl2_i), default=None)
+        if kl1 and kl2:
+            price_ll = pl2_p < pl1_p    # harga: Lower Low
+            stoch_hl = kl2[1] > kl1[1]  # stoch: Higher Low
+            if price_ll and stoch_hl and kl1[1] < 40:   # konfirmasi: stoch dari zona rendah
+                return "BULLISH_DIV"
+
+    # ── Cek Bearish Divergence: Harga HH, Stoch RSI LH ──────────────────────
+    if len(price_highs) >= 2 and len(k_highs) >= 2:
+        ph1_i, ph1_p = price_highs[-2]
+        ph2_i, ph2_p = price_highs[-1]
+        kh1 = min(k_highs, key=lambda x: abs(x[0] - ph1_i), default=None)
+        kh2 = min(k_highs, key=lambda x: abs(x[0] - ph2_i), default=None)
+        if kh1 and kh2:
+            price_hh = ph2_p > ph1_p    # harga: Higher High
+            stoch_lh = kh2[1] < kh1[1]  # stoch: Lower High
+            if price_hh and stoch_lh and kh1[1] > 60:   # konfirmasi: stoch dari zona tinggi
+                return "BEARISH_DIV"
+
+    return "NONE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  BTC MULTI-TF ANALYSIS — Daily → H4 → H1
+#     Strategy: Analisa Daily dulu, lalu konfirmasi H4, entry di H1
+#     Stochastic RSI 5,3,3 dipakai di setiap TF
+#     Jika BTC RANGING di Daily → tidak ada posisi sama sekali
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Cache hasil analisa BTC agar tidak re-fetch setiap pair
+_btc_multitf_cache: dict = {"result": None, "ts": 0.0}
+_BTC_MULTITF_CACHE_TTL = 120   # 2 menit cache
+
+@dataclass
+class BtcMultiTfResult:
+    """Hasil analisa BTC multi-timeframe."""
+    bias: str           # 'BULLISH' | 'BEARISH' | 'RANGING'
+    daily_bias: str     # bias dari Daily candle
+    h4_bias: str        # bias dari H4 candle
+    h1_bias: str        # bias dari H1 candle
+    daily_stoch_k: float
+    daily_stoch_d: float
+    daily_stoch_state: str   # OVERBOUGHT / OVERSOLD / NEUTRAL / CROSSING_UP / CROSSING_DOWN
+    h4_stoch_k: float
+    h4_stoch_d: float
+    h4_stoch_state: str
+    h1_stoch_k: float
+    h1_stoch_d: float
+    h1_stoch_state: str
+    h1_divergence: str   # BULLISH_DIV / BEARISH_DIV / NONE
+    h4_divergence: str
+    setup_valid: bool    # True = ada setup BTC yang jelas (bukan ranging)
+    reason: str          # penjelasan singkat untuk log/Telegram
+    allow_long: bool     # boleh ambil LONG alt
+    allow_short: bool    # boleh ambil SHORT alt
+
+
+def analyze_btc_multitf() -> BtcMultiTfResult:
+    """
+    Analisa BTC secara bertingkat: Daily → H4 → H1.
+
+    LOGIKA HIERARKI:
+    ─────────────────────────────────────────────────────
+    1. DAILY: Tentukan bias utama (BULLISH / BEARISH / RANGING)
+       - Pakai detect_structure + Stochastic RSI (5,3,3)
+       - Jika Daily RANGING → setup_valid=False → skip semua posisi
+       - Jika Daily OVERBOUGHT + BEARISH → konfirmasi short lebih kuat
+       - Jika Daily OVERSOLD + BULLISH → konfirmasi long lebih kuat
+
+    2. H4: Konfirmasi arah Daily
+       - Jika H4 sejalan dengan Daily → bias dikonfirmasi
+       - Jika H4 berlawanan → bias lemah (tapi tidak di-skip, hanya noted)
+       - Cek divergence H4 untuk konfirmasi reversal
+
+    3. H1: Cari entry timing
+       - Cek divergence H1 (paling penting untuk entry LTF)
+       - Stoch RSI H1 yang oversold = timing entry LONG
+       - Stoch RSI H1 yang overbought = timing entry SHORT
+    ─────────────────────────────────────────────────────
+    """
+    global _btc_multitf_cache
+
+    now_ts = time.time()
+    if (
+        _btc_multitf_cache["result"] is not None
+        and (now_ts - _btc_multitf_cache["ts"]) < _BTC_MULTITF_CACHE_TTL
+    ):
+        return _btc_multitf_cache["result"]
+
+    # ── Default fallback result ────────────────────────────────────────────────
+    def _fallback(reason: str) -> BtcMultiTfResult:
+        return BtcMultiTfResult(
+            bias="RANGING", daily_bias="RANGING", h4_bias="RANGING", h1_bias="RANGING",
+            daily_stoch_k=50.0, daily_stoch_d=50.0, daily_stoch_state="NEUTRAL",
+            h4_stoch_k=50.0, h4_stoch_d=50.0, h4_stoch_state="NEUTRAL",
+            h1_stoch_k=50.0, h1_stoch_d=50.0, h1_stoch_state="NEUTRAL",
+            h1_divergence="NONE", h4_divergence="NONE",
+            setup_valid=False, reason=reason, allow_long=False, allow_short=False,
+        )
+
     try:
-        df_btc = fetch_ohlcv("BTC/USDT", BTC_BIAS_TF, limit=200)
-        bias, _, _, _ = detect_structure(df_btc)
-        return bias
+        # ── STEP 1: Fetch data BTC semua TF ──────────────────────────────────────
+        df_daily = fetch_ohlcv("BTC/USDT", "1d",  limit=200)
+        df_h4    = fetch_ohlcv("BTC/USDT", "4h",  limit=200)
+        df_h1    = fetch_ohlcv("BTC/USDT", "1h",  limit=100)
+
+        if df_daily is None or len(df_daily) < 50:
+            return _fallback("BTC Daily data tidak cukup")
+        if df_h4 is None or len(df_h4) < 50:
+            return _fallback("BTC H4 data tidak cukup")
+
+        # ── STEP 2: Analisa Daily ──────────────────────────────────────────────
+        daily_bias, _, _, _ = detect_structure(df_daily)
+        d_k, d_d  = calc_stoch_rsi(df_daily, rsi_len=5, stoch_len=5, k_smooth=3, d_smooth=3)
+        d_state   = get_stoch_rsi_state(d_k, d_d)
+
+        # ── STEP 3: Analisa H4 ────────────────────────────────────────────────
+        h4_bias, _, _, _ = detect_structure(df_h4)
+        h4_k, h4_d = calc_stoch_rsi(df_h4, rsi_len=5, stoch_len=5, k_smooth=3, d_smooth=3)
+        h4_state   = get_stoch_rsi_state(h4_k, h4_d)
+        h4_div     = detect_divergence(df_h4, lookback=40)
+
+        # ── STEP 4: Analisa H1 ────────────────────────────────────────────────
+        h1_bias, _, _, _ = detect_structure(df_h1) if df_h1 is not None and len(df_h1) >= 30 else ("RANGING", None, None, None)
+        h1_k, h1_d = calc_stoch_rsi(df_h1, rsi_len=5, stoch_len=5, k_smooth=3, d_smooth=3) if df_h1 is not None else (50.0, 50.0)
+        h1_state   = get_stoch_rsi_state(h1_k, h1_d)
+        h1_div     = detect_divergence(df_h1, lookback=30) if df_h1 is not None else "NONE"
+
+        # ── STEP 5: Tentukan Bias Final & Izin Trading ────────────────────────
+        # RULE: Daily RANGING → tidak ada setup → stop semua posisi
+        if daily_bias == "RANGING":
+            result = BtcMultiTfResult(
+                bias="RANGING", daily_bias=daily_bias, h4_bias=h4_bias, h1_bias=h1_bias,
+                daily_stoch_k=d_k, daily_stoch_d=d_d, daily_stoch_state=d_state,
+                h4_stoch_k=h4_k, h4_stoch_d=h4_d, h4_stoch_state=h4_state,
+                h1_stoch_k=h1_k, h1_stoch_d=h1_d, h1_stoch_state=h1_state,
+                h1_divergence=h1_div, h4_divergence=h4_div,
+                setup_valid=False,
+                reason=(
+                    f"🔀 BTC Daily RANGING — tidak ada setup jelas. "
+                    f"Stoch Daily K={d_k:.1f}/D={d_d:.1f} ({d_state}). "
+                    f"Semua posisi DITUNDA sampai BTC punya arah."
+                ),
+                allow_long=False, allow_short=False,
+            )
+            _btc_multitf_cache = {"result": result, "ts": now_ts}
+            return result
+
+        # Daily punya bias (BULLISH atau BEARISH)
+        final_bias  = daily_bias
+        allow_long  = False
+        allow_short = False
+        reasons     = []
+
+        # ── LONG condition ────────────────────────────────────────────────────
+        if daily_bias == "BULLISH":
+            allow_long = True   # BTC Daily BULLISH → Long alt diizinkan
+            reasons.append(f"✅ BTC Daily BULLISH → Long alt OK")
+
+            # H4 konfirmasi
+            if h4_bias == "BULLISH":
+                reasons.append(f"✅ H4 konfirmasi BULLISH")
+            elif h4_bias == "RANGING":
+                reasons.append(f"⚠️ H4 RANGING — Long masih OK tapi kurang ideal")
+            else:
+                reasons.append(f"⚠️ H4 counter-BEARISH — hati-hati, Long tetap boleh tapi score kurang")
+
+            # Stoch Daily OVERBOUGHT → short mungkin lebih aman dari long
+            if d_state == "OVERBOUGHT":
+                reasons.append(f"⚠️ Daily Stoch OVERBOUGHT (K={d_k:.1f}) — momentum bisa lemah")
+            elif d_state == "OVERSOLD":
+                reasons.append(f"✅ Daily Stoch OVERSOLD (K={d_k:.1f}) — momentum bullish fresh")
+
+            # H1 Divergence: Bullish Div di H1 = timing entry Long ideal
+            if h1_div == "BULLISH_DIV":
+                reasons.append(f"✅ H1 Bullish Divergence — timing entry LONG sangat baik")
+            elif h1_div == "BEARISH_DIV":
+                reasons.append(f"⚠️ H1 Bearish Divergence — kurangi size atau tunda Long")
+
+            # H4 Bearish Divergence saat Daily bullish = waspada long
+            if h4_div == "BEARISH_DIV":
+                reasons.append(f"⚠️ H4 Bearish Divergence — pertimbangkan tunda Long")
+
+            # H1 Stoch oversold = timing entry ideal
+            if h1_state == "OVERSOLD":
+                reasons.append(f"✅ H1 Stoch OVERSOLD (K={h1_k:.1f}) — pullback selesai, entry timing OK")
+
+        # ── SHORT condition ───────────────────────────────────────────────────
+        elif daily_bias == "BEARISH":
+            allow_short = True   # BTC Daily BEARISH → Short alt diizinkan
+            reasons.append(f"✅ BTC Daily BEARISH → Short alt OK")
+
+            if h4_bias == "BEARISH":
+                reasons.append(f"✅ H4 konfirmasi BEARISH")
+            elif h4_bias == "RANGING":
+                reasons.append(f"⚠️ H4 RANGING — Short masih OK tapi kurang ideal")
+            else:
+                reasons.append(f"⚠️ H4 counter-BULLISH — hati-hati, Short tetap boleh tapi score kurang")
+
+            if d_state == "OVERSOLD":
+                reasons.append(f"⚠️ Daily Stoch OVERSOLD (K={d_k:.1f}) — momentum bear bisa lemah")
+            elif d_state == "OVERBOUGHT":
+                reasons.append(f"✅ Daily Stoch OVERBOUGHT (K={d_k:.1f}) — momentum bearish fresh")
+
+            if h1_div == "BEARISH_DIV":
+                reasons.append(f"✅ H1 Bearish Divergence — timing entry SHORT sangat baik")
+            elif h1_div == "BULLISH_DIV":
+                reasons.append(f"⚠️ H1 Bullish Divergence — kurangi size atau tunda Short")
+
+            if h4_div == "BULLISH_DIV":
+                reasons.append(f"⚠️ H4 Bullish Divergence — pertimbangkan tunda Short")
+
+            if h1_state == "OVERBOUGHT":
+                reasons.append(f"✅ H1 Stoch OVERBOUGHT (K={h1_k:.1f}) — pullback selesai, entry timing OK")
+
+        reason_str = " | ".join(reasons)
+
+        result = BtcMultiTfResult(
+            bias=final_bias, daily_bias=daily_bias, h4_bias=h4_bias, h1_bias=h1_bias,
+            daily_stoch_k=d_k, daily_stoch_d=d_d, daily_stoch_state=d_state,
+            h4_stoch_k=h4_k, h4_stoch_d=h4_d, h4_stoch_state=h4_state,
+            h1_stoch_k=h1_k, h1_stoch_d=h1_d, h1_stoch_state=h1_state,
+            h1_divergence=h1_div, h4_divergence=h4_div,
+            setup_valid=True, reason=reason_str,
+            allow_long=allow_long, allow_short=allow_short,
+        )
+        _btc_multitf_cache = {"result": result, "ts": now_ts}
+        return result
+
+    except Exception as e:
+        print(f"  ❌ analyze_btc_multitf error: {e}")
+        return _fallback(f"Error analisa BTC: {e}")
+
+
+def get_btc_bias() -> str:
+    """
+    Wrapper kompatibilitas: return string bias BTC dari analisa multi-TF baru.
+    Digunakan oleh kode lama yang memanggil get_btc_bias().
+    """
+    try:
+        result = analyze_btc_multitf()
+        return result.bias
     except Exception:
         return "RANGING"
 
@@ -9470,10 +9850,13 @@ def evaluate_htf_ranging(
 # ██  SECTION 21 — PAIR ANALYSIS v5 (HTF RANGING ADAPTIVE)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, signal_candidates):
+def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, signal_candidates,
+                 btc_allow_long: bool = True, btc_allow_short: bool = True,
+                 btc_h1_div: str = "NONE", btc_h4_div: str = "NONE",
+                 btc_h1_stoch_state: str = "NEUTRAL"):
     """
     ═══════════════════════════════════════════════════════════════
-    SMC FLOW — SCORING MURNI (v6)
+    SMC FLOW — SCORING MURNI (v6) + BTC MULTI-TF FILTER
     ═══════════════════════════════════════════════════════════════
     Step 1 : HTF → tentukan bias arah
     Step 2 : LTF → cari liquidity target (sweep / reaksi)
@@ -9569,6 +9952,23 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         if _dir_str != _DIRECTION_FILTER:
             print(f"  ⏭  [{label}] {pair} {_dir_str} — difilter (hanya {_DIRECTION_FILTER})")
             return
+
+    # ── BTC MULTI-TF DIRECTION GATE ──────────────────────────────────────────
+    # Gate utama berbasis BTC Daily → H4 → H1 analysis.
+    # LONG diblok jika BTC Daily bukan BULLISH.
+    # SHORT diblok jika BTC Daily bukan BEARISH.
+    # Exception: BTCUSDT sendiri lolos (BTC tidak filter dirinya sendiri).
+    _is_btc_pair = pair in ("BTCUSDT", "BTC/USDT")
+    if not _is_btc_pair:
+        if trade_direction == "BULLISH" and not btc_allow_long:
+            _dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
+            print(f"  🚫 [{label}] {pair} {_dir} — BTC Daily tidak BULLISH, diblok BTC Multi-TF Gate")
+            return
+        if trade_direction == "BEARISH" and not btc_allow_short:
+            _dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
+            print(f"  🚫 [{label}] {pair} {_dir} — BTC Daily tidak BEARISH, diblok BTC Multi-TF Gate")
+            return
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── MARKET REGIME HARDBLOCK — BTC EMA + BTCD EMA ─────────────────────────
     # Layer pertahanan paling awal, sebelum apapun diproses:
@@ -9704,6 +10104,49 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     m_pts, macro_reason = macro_score(pair, trade_direction, btc_bias, btcd_trend)
     ema_pts, ema_reason, ema20, ema50, ema200 = get_ema_score(df_entry, trade_direction)
+
+    # ── BONUS/PENALTY dari BTC Multi-TF Divergence & Stoch State ──────────────
+    # Bonus maksimal +10 (divergence + stoch state ideal searah trade)
+    # Penalty maksimal -10 (divergence berlawanan arah trade)
+    _btc_mtf_bonus = 0
+    _btc_mtf_notes = []
+
+    if not _is_btc_pair:
+        # Divergence H1 BTC searah trade = timing entry sempurna
+        if trade_direction == "BULLISH" and btc_h1_div == "BULLISH_DIV":
+            _btc_mtf_bonus += 6
+            _btc_mtf_notes.append("BTC H1 Bullish Div (timing Long ideal) +6")
+        elif trade_direction == "BEARISH" and btc_h1_div == "BEARISH_DIV":
+            _btc_mtf_bonus += 6
+            _btc_mtf_notes.append("BTC H1 Bearish Div (timing Short ideal) +6")
+        # Divergence H1 BTC berlawanan = counter-signal
+        elif trade_direction == "BULLISH" and btc_h1_div == "BEARISH_DIV":
+            _btc_mtf_bonus -= 5
+            _btc_mtf_notes.append("BTC H1 Bearish Div saat Long -5")
+        elif trade_direction == "BEARISH" and btc_h1_div == "BULLISH_DIV":
+            _btc_mtf_bonus -= 5
+            _btc_mtf_notes.append("BTC H1 Bullish Div saat Short -5")
+
+        # Divergence H4 BTC searah trade = konfirmasi lebih kuat
+        if trade_direction == "BULLISH" and btc_h4_div == "BULLISH_DIV":
+            _btc_mtf_bonus += 4
+            _btc_mtf_notes.append("BTC H4 Bullish Div +4")
+        elif trade_direction == "BEARISH" and btc_h4_div == "BEARISH_DIV":
+            _btc_mtf_bonus += 4
+            _btc_mtf_notes.append("BTC H4 Bearish Div +4")
+
+        # Stoch RSI H1 BTC: Oversold saat Long = pullback selesai
+        if trade_direction == "BULLISH" and btc_h1_stoch_state in ("OVERSOLD", "CROSSING_UP"):
+            _btc_mtf_bonus += 3
+            _btc_mtf_notes.append(f"BTC H1 Stoch {btc_h1_stoch_state} → timing Long bagus +3")
+        elif trade_direction == "BEARISH" and btc_h1_stoch_state in ("OVERBOUGHT", "CROSSING_DOWN"):
+            _btc_mtf_bonus += 3
+            _btc_mtf_notes.append(f"BTC H1 Stoch {btc_h1_stoch_state} → timing Short bagus +3")
+
+    if _btc_mtf_bonus != 0:
+        m_pts = m_pts + _btc_mtf_bonus
+        if _btc_mtf_notes:
+            macro_reason = macro_reason + " | BTC MTF: " + ", ".join(_btc_mtf_notes)
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 4b — BTC/BTCD LTF CORRELATION FILTER
@@ -10346,14 +10789,60 @@ def main():
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            btc_bias   = get_btc_bias()
-            # BTC.D: fetch hanya jika filter aktif (hemat API call jika off)
+            # ═══════════════════════════════════════════════════════════════
+            # ██  LANGKAH 1 — ANALISA BTC MULTI-TF (PRIORITAS TERTINGGI)
+            #
+            # BTC dianalisa LEBIH DULU sebelum scan altcoin apapun.
+            # Urutan: Daily → H4 → H1, pakai Stochastic RSI 5,3,3 + Divergence
+            #
+            # ATURAN UTAMA:
+            #   • BTC Daily RANGING        → SKIP SEMUA POSISI (tidak ada setup)
+            #   • BTC Daily BULLISH        → Long alt diizinkan
+            #   • BTC Daily BEARISH        → Short alt diizinkan
+            #   • BTCD naik + BTC bearish  → Short tetap OK (alt season bearish)
+            #   • BTCD turun + BTC bullish → Long tetap OK (alt season bullish)
+            # ═══════════════════════════════════════════════════════════════
+            btc_mtf = analyze_btc_multitf()
+            btc_bias = btc_mtf.bias   # kompatibel dengan kode lama
+
+            print(f"\n{'─'*70}")
+            print(f"🔍 ANALISA BTC MULTI-TIMEFRAME (Daily→H4→H1):")
+            print(f"   Daily : {btc_mtf.daily_bias} | Stoch K={btc_mtf.daily_stoch_k:.1f} D={btc_mtf.daily_stoch_d:.1f} [{btc_mtf.daily_stoch_state}]")
+            print(f"   H4    : {btc_mtf.h4_bias}    | Stoch K={btc_mtf.h4_stoch_k:.1f} D={btc_mtf.h4_stoch_d:.1f} [{btc_mtf.h4_stoch_state}] | Div: {btc_mtf.h4_divergence}")
+            print(f"   H1    : {btc_mtf.h1_bias}    | Stoch K={btc_mtf.h1_stoch_k:.1f} D={btc_mtf.h1_stoch_d:.1f} [{btc_mtf.h1_stoch_state}] | Div: {btc_mtf.h1_divergence}")
+            print(f"   Setup : {'✅ VALID' if btc_mtf.setup_valid else '🚫 RANGING — SKIP SEMUA POSISI'}")
+            print(f"   Arah  : Long={'✅' if btc_mtf.allow_long else '❌'} | Short={'✅' if btc_mtf.allow_short else '❌'}")
+            print(f"   Alasan: {btc_mtf.reason}")
+
+            # ── GATE UTAMA: Jika BTC tidak punya setup → skip scan pair ─────────
+            if not btc_mtf.setup_valid:
+                print(f"\n🛑 BTC RANGING di Daily — tidak ada setup jelas.")
+                print(f"   Semua scan altcoin DITUNDA sampai BTC punya arah trending.")
+                # Kirim notif Telegram setiap N menit sekali (tidak setiap scan)
+                _btc_ranging_notif_key = "btc_ranging_last_notif"
+                _last_notif_ts = getattr(analyze_btc_multitf, "_ranging_notif_ts", 0)
+                if time.time() - _last_notif_ts > 1800:   # 30 menit sekali
+                    analyze_btc_multitf._ranging_notif_ts = time.time()
+                    send_telegram_raw(
+                        f"⏸ <b>BTC Ranging — Scan Ditunda</b>\n"
+                        f"{'─'*38}\n"
+                        f"📊 BTC Daily : <b>RANGING</b> (tidak ada setup trending)\n"
+                        f"🔢 Stoch Daily K={btc_mtf.daily_stoch_k:.1f} D={btc_mtf.daily_stoch_d:.1f} [{btc_mtf.daily_stoch_state}]\n"
+                        f"🔢 Stoch H4   K={btc_mtf.h4_stoch_k:.1f} D={btc_mtf.h4_stoch_d:.1f} [{btc_mtf.h4_stoch_state}]\n"
+                        f"{'─'*38}\n"
+                        f"⚠️ Strategi: Tidak ambil posisi saat BTC ranging.\n"
+                        f"Bot akan otomatis resume saat BTC punya arah trending kembali."
+                    )
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # ── BTC.D: fetch untuk filter korelasi ───────────────────────────────
             if BTC_CORR_FILTER_ON:
                 btcd_trend = get_btcd_bias()
-                print(f"🪙 BTC Bias ({BTC_BIAS_TF}): {btc_bias} | BTC.D ({BTCD_TF}): {btcd_trend} | Corr Filter: ON")
+                print(f"🪙 BTC Bias Final: {btc_bias} | BTC.D ({BTCD_TF}): {btcd_trend} | Corr Filter: ON")
             else:
                 btcd_trend = "FLAT"
-                print(f"🪙 BTC Bias ({BTC_BIAS_TF}): {btc_bias} | BTC.D: OFF")
+                print(f"🪙 BTC Bias Final: {btc_bias} | BTC.D: OFF")
 
             # ── MARKET REGIME — log setiap scan (cache 3 menit, tidak overload API) ──
             _mr, _mr_reason, _mr_bl, _mr_bs = get_market_regime()
@@ -10402,6 +10891,8 @@ def main():
                     if df_htf is None:
                         continue
                     try:
+                        # ── Filter arah berdasarkan BTC multi-TF result ──────────
+                        # Setiap pair dicek apakah arahnya diizinkan oleh BTC setup
                         analyze_pair(
                             pair             = pair,
                             mode             = mode,
@@ -10411,6 +10902,11 @@ def main():
                             btcd_trend       = btcd_trend,
                             session          = session,
                             signal_candidates= local_candidates,
+                            btc_allow_long   = btc_mtf.allow_long,
+                            btc_allow_short  = btc_mtf.allow_short,
+                            btc_h1_div       = btc_mtf.h1_divergence,
+                            btc_h4_div       = btc_mtf.h4_divergence,
+                            btc_h1_stoch_state = btc_mtf.h1_stoch_state,
                         )
                     except Exception as e:
                         print(f"  ❌ [{mode['label']}] {pair}: {e}")
