@@ -1,6 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║  BOT AUTO TRADE — BINANCE LIVE × PA + S&D + S/R + BTC MULTI-TF ENGINE   ║
+║  v2 UPDATE:                                                              ║
+║  ✅ RALLY EXHAUSTION GATE: Blok LONG saat BTC kehabisan bensin          ║
+║     • is_rally_exhausted(): Stoch RSI %K > 78 + gap mengecil +          ║
+║       upper wick rejection candle BTC 1H                                ║
+║     • Toggle: EXHAUSTION_ENABLED = True/False                           ║
+║  ✅ AVERAGE MARKET RSI GATE: Patokan kondisi market dari semua pair     ║
+║     • Dihitung SETELAH scan selesai (bukan per-pair isolated)           ║
+║     • Avg RSI > 70 → blok semua LONG | < 30 → blok semua SHORT         ║
+║     • Print di setiap scan: "📊 Average Market RSI: xx.xx"             ║
 ║                                                                          ║
 ║  SIGNAL METHOD:                                                          ║
 ║  ✅ HTF Trend Bias (4H/1D) — via swing high/low structure               ║
@@ -10581,6 +10590,83 @@ def fetch_all_tf_for_pair(pair, htf_tfs, ref_tfs) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 21b — RALLY EXHAUSTION GATE & AVERAGE MARKET RSI
+# ═══════════════════════════════════════════════════════════════════════════
+
+EXHAUSTION_STOCH_THRESHOLD = 78   # %K di atas ini = overbought zone
+EXHAUSTION_STOCH_D_GAP     = 5    # %K - %D < 5 dan mengecil = momentum melemah
+EXHAUSTION_ENABLED         = True # toggle on/off
+
+
+def is_rally_exhausted() -> tuple:
+    """
+    Deteksi apakah rally BTC sudah exhaustion berdasarkan 3 konfirmasi:
+    1. Stoch RSI %K > 78 (overbought zone)
+    2. Gap %K - %D mengecil (momentum melemah)
+    3. Candle BTC 1H terakhir punya upper wick rejection
+
+    Return: (is_exhausted: bool, reason: str)
+    """
+    if not EXHAUSTION_ENABLED:
+        return False, "Exhaustion gate disabled"
+    try:
+        df_btc = fetch_ohlcv("BTC/USDT", "1h", limit=100)
+    except Exception as e:
+        return False, f"BTC fetch error: {e}"
+    if df_btc is None or len(df_btc) < 20:
+        return False, "Data BTC tidak cukup"
+
+    k_now, d_now = calc_stoch_rsi(df_btc)
+
+    # Hitung nilai sebelumnya (potong 1 candle terakhir)
+    k_prev, d_prev = calc_stoch_rsi(df_btc.iloc[:-1])
+
+    gap_now  = k_now - d_now
+    gap_prev = k_prev - d_prev
+
+    if k_now < EXHAUSTION_STOCH_THRESHOLD:
+        return False, f"Stoch %K={k_now:.1f} belum overbought"
+
+    momentum_weak = gap_now < gap_prev and gap_now < EXHAUSTION_STOCH_D_GAP
+
+    last = df_btc.iloc[-1]
+    o, h, cl = float(last["open"]), float(last["high"]), float(last["close"])
+    body       = abs(cl - o)
+    upper_wick = h - max(o, cl)
+    wick_ratio = upper_wick / body if body > 1e-9 else 0
+    rejection_candle = wick_ratio > 1.2 and cl < o
+
+    if momentum_weak and rejection_candle:
+        return True, (
+            f"Exhaustion: Stoch %K={k_now:.1f} OB | "
+            f"gap {gap_prev:.1f}→{gap_now:.1f} melemah | "
+            f"BTC upper wick rejection {wick_ratio:.1f}x"
+        )
+    if momentum_weak:
+        return True, (
+            f"Exhaustion: Stoch %K={k_now:.1f} OB | "
+            f"gap melemah {gap_prev:.1f}→{gap_now:.1f}"
+        )
+    return False, f"Stoch %K={k_now:.1f}, gap={gap_now:.1f} — belum exhausted"
+
+
+def get_average_market_rsi(signal_candidates: list) -> float:
+    """
+    Hitung rata-rata RSI dari semua pair hasil scan.
+    Dipakai sebagai patokan kondisi market keseluruhan setelah scan selesai.
+
+    > 70 → Market overbought → blok sinyal LONG
+    < 30 → Market oversold  → blok sinyal SHORT
+
+    Return: float (default 50.0 jika tidak ada data)
+    """
+    rsi_values = [c["rsi"] for c in signal_candidates if c.get("rsi") and 0 < c["rsi"] <= 100]
+    if not rsi_values:
+        return 50.0
+    return round(sum(rsi_values) / len(rsi_values), 2)
+
+
 # ██  SECTION 22b — STARTUP IP DETECTION & WHITELIST REMINDER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -10867,6 +10953,11 @@ def main():
             htf_tfs_active = list({m["htf_tf"] for m in _active_modes})
             ref_tfs_needed = list({m["ref_tf"] for m in _active_modes if m.get("ref_tf")})
 
+            # ── Rally Exhaustion Gate — cek sebelum scan dimulai ─────────────
+            exhaustion_mode, exhaustion_reason = is_rally_exhausted()
+            if exhaustion_mode:
+                print(f"⛽ RALLY EXHAUSTION DETECTED — sinyal LONG akan diblok\n   {exhaustion_reason}")
+
             # OPT: limit candle per TF — HTF & ref cukup 150, hemat ~40% data transfer
             _TF_LIMIT_MAP = {tf: 150 for tf in htf_tfs_active}
             for tf in ref_tfs_needed:
@@ -10934,6 +11025,13 @@ def main():
                     seen[key] = cand
             signal_candidates = list(seen.values())
 
+            # ── Average Market RSI — dihitung setelah scan semua pair selesai ─
+            avg_rsi = get_average_market_rsi(signal_candidates)
+            long_rsi_blocked  = avg_rsi > 70
+            short_rsi_blocked = avg_rsi < 30
+            rsi_status = "🔴 OB" if long_rsi_blocked else ("🟢 OS" if short_rsi_blocked else "✅ Normal")
+            print(f"📊 Average Market RSI: {avg_rsi:.2f} {rsi_status}")
+
             if signal_candidates:
                 # ── Hitung slot kosong setelah scan semua pair selesai ────────
                 _cur_open  = count_open_positions() + len(pending_limit_orders)
@@ -10976,6 +11074,20 @@ def main():
                         entry, sl  = cand["entry"], cand["sl"]
                         dir_str    = "LONG" if cand["direction"] == "BULLISH" else "SHORT"
                         tier_label = cand["tier"]
+
+                        # ── Rally Exhaustion Gate ────────────────────────────
+                        if exhaustion_mode and cand["direction"] == "BULLISH":
+                            print(f"  ⛽ EXHAUSTION → {pair} LONG diblok ({exhaustion_reason})")
+                            continue
+
+                        # ── Average Market RSI Gate ──────────────────────────
+                        if long_rsi_blocked and cand["direction"] == "BULLISH":
+                            print(f"  📊 AVG RSI {avg_rsi:.1f} OVERBOUGHT → {pair} LONG diblok")
+                            continue
+                        if short_rsi_blocked and cand["direction"] == "BEARISH":
+                            print(f"  📊 AVG RSI {avg_rsi:.1f} OVERSOLD → {pair} SHORT diblok")
+                            continue
+
                         print(f"  🚨 SIGNAL → {pair} {dir_str} | Score:{cand['score']} Grade:{sig['grade']} RR:1:{cand['rr']} Tier:{tier_label}")
 
                         execute_trade(sig, cand["mode"])
