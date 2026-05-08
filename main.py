@@ -43,7 +43,7 @@
 ║       /resumeorpause    — toggle pause/resume bot                       ║
 ║       /closeallposition — tutup semua posisi aktif                      ║
 ║       /changeliveordemo — toggle LIVE ↔ DEMO (mainnet/testnet)         ║
-║       /setmarginratio <persen>  — set margin % per trade (6% default)       ║
+║       /setmarginratio <persen>  — set max SL loss % per trade (1% default)       ║
 ║       /setfixedlev <leverage>   — leverage tetap semua trade (override tier)║
 ║       /resetmm                  — reset ke MM dinamis (risk % + auto-tier)  ║
 ║       /setscoreupto <score>     — filter min score sinyal (1–100, 0=reset) ║
@@ -185,7 +185,8 @@ def _serialize_state() -> dict:
 
     return {
         "BOT_MODE":                  BOT_MODE,
-        "MARGIN_RATIO":              MARGIN_RATIO,
+        "MAX_SL_LOSS_PCT":           MAX_SL_LOSS_PCT,
+        "MARGIN_RATIO":              MAX_SL_LOSS_PCT,   # backward-compat
         "FIXED_LEVERAGE":            FIXED_LEVERAGE,
         "MAX_OPEN_TRADES":           MAX_OPEN_TRADES,
         "_user_set_max_trades":      _user_set_max_trades,
@@ -231,7 +232,7 @@ def load_state():
     Jika file tidak ada atau rusak → pakai default (fresh start).
     Dipanggil SEKALI di awal main() sebelum telegram polling.
     """
-    global BOT_MODE, MARGIN_RATIO, FIXED_LEVERAGE, MAX_OPEN_TRADES
+    global BOT_MODE, MAX_SL_LOSS_PCT, MARGIN_RATIO, FIXED_LEVERAGE, MAX_OPEN_TRADES
     global _user_set_max_trades, bot_paused, MIN_SCORE_CUSTOM, MIN_SCORE_RELAXED_CUSTOM
     global BTC_CORR_FILTER_ON, _ACTIVE_MODE_FILTER, _DIRECTION_FILTER, TP1_PROFIT_PCT, TP1_PARTIAL
     global DAILY_LOSS_LIMIT_PCT, DAILY_WIN_LIMIT_PCT
@@ -251,7 +252,10 @@ def load_state():
 
         # ── Setting variables ──────────────────────────────────────────────
         BOT_MODE                 = data.get("BOT_MODE",                 BOT_MODE)
-        MARGIN_RATIO             = data.get("MARGIN_RATIO",             MARGIN_RATIO)
+        # Load MAX_SL_LOSS_PCT — fallback ke MARGIN_RATIO lama untuk backward-compat
+        _loaded_sl = data.get("MAX_SL_LOSS_PCT", data.get("MARGIN_RATIO", MAX_SL_LOSS_PCT))
+        MAX_SL_LOSS_PCT          = _loaded_sl
+        MARGIN_RATIO             = _loaded_sl   # alias
         FIXED_LEVERAGE           = data.get("FIXED_LEVERAGE",           FIXED_LEVERAGE)
         MAX_OPEN_TRADES          = data.get("MAX_OPEN_TRADES",          MAX_OPEN_TRADES)
         _user_set_max_trades     = data.get("_user_set_max_trades",     _user_set_max_trades)
@@ -335,7 +339,7 @@ def load_state():
         print(
             f"✅ State berhasil dimuat:\n"
             f"   BOT_MODE={BOT_MODE} | bot_paused={bot_paused} | "
-            f"MARGIN={MARGIN_RATIO*100:.1f}% | LEV_FIXED={FIXED_LEVERAGE} | "
+            f"MAX_SL={MAX_SL_LOSS_PCT*100:.1f}% | LEV_FIXED={FIXED_LEVERAGE} | "
             f"MAX_TRADES={MAX_OPEN_TRADES}\n"
             f"   Score={MIN_SCORE_CUSTOM} | BTC_FILTER={BTC_CORR_FILTER_ON} | "
             f"MODE_FILTER={_ACTIVE_MODE_FILTER}\n"
@@ -397,15 +401,17 @@ def get_base_url() -> str:
 AUTO_TRADING     = True
 RISK_PER_TRADE   = 0.30          # 30% balance per trade — modal $50: 30%×15x=$225 notional ✅ penuhi minNotional Binance ($100)
 
-# ── Margin Ratio per Trade ───────────────────────────────────────────────────
-# Setiap trade, lot disesuaikan agar margin yang digunakan = MARGIN_RATIO × balance.
-# Margin = notional / leverage. Lot dihitung agar margin tidak melebihi batas ini,
-# tapi sedekat mungkin dengan batas (misal 6% dari $10.000 = $600 margin).
-# Rumus: target_notional = MARGIN_RATIO × balance × leverage
-#        lot = target_notional / entry_price
-# Contoh: balance $10.000, ratio 6%, lev 10x → margin=$600, notional=$6.000
-# Ganti persentase di bawah atau via /setmarginratio (misal 6 → 6%)
-MARGIN_RATIO     = 0.06              # 6% dari total balance sebagai margin per trade
+# ── Max SL Loss Per Trade ────────────────────────────────────────────────────
+# Setiap trade, lot disesuaikan agar kerugian maksimal (jika kena SL) tidak
+# melebihi MAX_SL_LOSS_PCT × total_balance.
+# Rumus: max_loss_usdt = MAX_SL_LOSS_PCT × balance
+#        lot = max_loss_usdt / sl_distance_per_unit
+# Contoh: balance $10.000, max SL 1%, SL jarak 2% dari entry →
+#         max_loss=$100, lot=$100/($200×2%)=$100/$4=25 unit
+# Lot boleh berapa saja selama potensi loss jika SL kena ≤ MAX_SL_LOSS_PCT × balance.
+# Ganti persentase di bawah atau via /setmarginratio (misal 1 → maks rugi 1% dari balance)
+MAX_SL_LOSS_PCT  = 0.01              # 1% dari total balance sebagai max loss per trade jika SL kena
+MARGIN_RATIO     = MAX_SL_LOSS_PCT   # alias backward-compat (dipakai di beberapa tempat lain)
 MAX_OPEN_TRADES  = 1             # modal <$100 → max 1 posisi saja. Naik otomatis saat saldo bertambah
 BALANCE_TO_USE   = 1.0           # gunakan 100% available balance
 TP1_PARTIAL      = 0.5   # Porsi lot yang di-close di TP1 (0.25 = 25%, 0.5 = 50%). Ubah via /settp1partial
@@ -5587,18 +5593,18 @@ def execute_trade(signal: dict, mode: dict):
         send_telegram_raw(_msg)
         return
 
-    # ── MARGIN RATIO: Lot disesuaikan agar margin = MARGIN_RATIO × balance ──────
+    # ── MAX SL LOSS: Lot disesuaikan agar loss jika SL kena ≤ MAX_SL_LOSS_PCT × balance ──
     #
-    # Logika:
-    #   1. target_margin = MARGIN_RATIO × total_balance  (misal 6% × $10.000 = $600)
-    #   2. target_margin di-cap ke MAX_RISK_PER_TRADE_USDT_RATIO × available_bal
-    #   3. leverage dipilih dari tier (atau FIXED_LEVERAGE jika diset)
-    #   4. target_notional = target_margin × leverage
-    #   5. lot = target_notional / entry_price
-    #   6. Lot di-floor ke step size — margin aktual ≤ target_margin (tidak pernah melebihi)
+    # Logika baru (SL-based sizing):
+    #   1. max_loss_usdt = MAX_SL_LOSS_PCT × total_balance
+    #      (misal 1% × $10.000 = $100 — ini kerugian MAKSIMAL jika SL kena)
+    #   2. sl_distance = |entry - stop_loss|  (dalam unit harga)
+    #   3. lot = max_loss_usdt / sl_distance
+    #      → berapa unit agar loss aktual saat SL kena = max_loss_usdt
+    #   4. Lot di-clamp ke exchange limits dan cap notional
     #
-    # Tujuan: setiap posisi menggunakan margin yang sama (% dari balance),
-    # bukan berdasarkan jarak SL. Lot = fungsi langsung dari margin ratio.
+    # Tujuan: berapa pun jarak SL-nya, LOSS MAKSIMAL TETAP = X% dari balance.
+    # Lot otomatis menyesuaikan: SL dekat → lot besar, SL jauh → lot kecil.
     _entry       = signal["entry"]
     _sl          = signal["stop_loss"]
     _sl_dist_abs = abs(_entry - _sl)
@@ -5609,17 +5615,29 @@ def execute_trade(signal: dict, mode: dict):
     else:
         trade_leverage = get_leverage_for_price(_entry)
 
-    # Target margin = MARGIN_RATIO × balance, di-cap ke batas aman
-    _margin_cap  = available_bal * MAX_RISK_PER_TRADE_USDT_RATIO
-    _raw_margin  = balance * MARGIN_RATIO
-    # Pakai margin sedekat mungkin ke target, tapi tidak melebihi cap
-    margin_usdt  = min(_raw_margin, _margin_cap)
+    # ── Hitung lot dari max SL loss ───────────────────────────────────────────
+    max_loss_usdt = balance * MAX_SL_LOSS_PCT            # kerugian maks jika SL kena
+    min_sl_dist   = _entry * MIN_SL_DISTANCE_PCT         # jarak SL minimum (anti-noise)
+    eff_sl_dist   = max(_sl_dist_abs, min_sl_dist)       # pakai yang lebih besar
+    raw_lot       = max_loss_usdt / max(eff_sl_dist, 1e-9)
 
-    target_notional = margin_usdt * trade_leverage
-    raw_lot         = target_notional / max(_entry, 1e-9)
+    # ── Cap notional agar tidak over-margin ──────────────────────────────────
+    # Meski lot dari SL bisa besar, notional (posisi) tidak boleh melebihi
+    # available_bal × leverage × MAX_RISK_PER_TRADE_USDT_RATIO
+    _margin_cap      = available_bal * MAX_RISK_PER_TRADE_USDT_RATIO
+    _max_notional    = _margin_cap * trade_leverage
+    _lot_cap_notional = _max_notional / max(_entry, 1e-9)
+    if raw_lot > _lot_cap_notional:
+        print(f"  ⚠️  [{symbol}] lot dari SL={raw_lot:.4f} > cap notional={_lot_cap_notional:.4f} → di-cap")
+        raw_lot = _lot_cap_notional
+
+    # Margin aktual yang akan digunakan (untuk log/info)
+    margin_usdt     = (raw_lot * _entry) / max(trade_leverage, 1)
+    target_notional = raw_lot * _entry
     print(
-        f"  🎯 MARGIN RATIO: ratio={MARGIN_RATIO*100:.2f}% | margin={margin_usdt:.2f} USDT | "
-        f"lev={trade_leverage}x | notional={target_notional:.2f} | lot={raw_lot:.4f}"
+        f"  🎯 MAX SL LOSS: {MAX_SL_LOSS_PCT*100:.2f}% | max_loss={max_loss_usdt:.2f} USDT | "
+        f"sl_dist={eff_sl_dist:.4f} ({_sl_dist_pct*100:.2f}%) | "
+        f"lev={trade_leverage}x | lot={raw_lot:.4f} | notional={target_notional:.2f} | margin={margin_usdt:.2f}"
     )
 
     # ── Pre-check minNotional dengan leverage yang sudah ditetapkan ──────────
@@ -5628,7 +5646,7 @@ def execute_trade(signal: dict, mode: dict):
         print(f"  ⚡ [{symbol}] PRE-CHECK skip: minNotional={_pre_min_notional} > capacity={_pre_capacity:.2f}")
         return
 
-    print(f"  📐 [{symbol}] margin={margin_usdt:.2f} × {trade_leverage}x → notional={target_notional:.2f} → raw_lot={raw_lot:.4f}")
+    print(f"  📐 [{symbol}] max_loss={max_loss_usdt:.2f} USDT | sl_dist={eff_sl_dist:.4f} × {trade_leverage}x → notional={target_notional:.2f} → raw_lot={raw_lot:.4f}")
 
     # ── Re-fetch filter real-time untuk symbol ini ──────────────────────────
     # Cache mungkin stale atau MARKET_LOT_SIZE berubah — query langsung lebih aman
@@ -7496,7 +7514,7 @@ def cmd_status():
         f"{pos_block}\n"
         f"{'─'*38}\n"
         f"⚙️ Config:\n"
-        f"  Margin {MARGIN_RATIO*100:.1f}%/trade | Max {MAX_OPEN_TRADES} trades | Lev auto-tier\n"
+        f"  Max SL {MAX_SL_LOSS_PCT*100:.1f}%/trade | Max {MAX_OPEN_TRADES} trades | Lev auto-tier\n"
         f"  {score_line}\n"
         f"  {btc_corr_line}\n"
         f"  {scan_mode_line}\n"
@@ -7662,7 +7680,7 @@ def cmd_start():
         f"▶️ Scanning & trading aktif.\n"
         f"💼 Balance   : <b>{bal_str}</b>\n"
         f"🌐 Mode      : <b>{mode_em}</b>\n"
-        f"⚡ Margin/trade: <b>{MARGIN_RATIO*100:.1f}%</b> dari balance | Max: <b>{MAX_OPEN_TRADES}</b> trades\n"
+        f"⚡ Max SL/trade: <b>{MAX_SL_LOSS_PCT*100:.1f}%</b> dari balance | Max: <b>{MAX_OPEN_TRADES}</b> trades\n"
         f"{'─'*34}\n"
         f"Gunakan /status untuk cek kondisi bot."
         f"{pos_note}"
@@ -7802,66 +7820,78 @@ def cmd_closeallposition():
 def cmd_setmarginratio(parts: list):
     """
     /setmarginratio <persen>
-    Set MARGIN_RATIO — margin yang digunakan per trade sebagai % dari total balance.
-    Margin = modal yang dikunci Binance untuk 1 posisi (bukan max loss).
-    Contoh: /setmarginratio 6   → setiap trade pakai margin 6% dari balance
-            /setmarginratio 10  → setiap trade pakai margin 10% dari balance
-    Range  : 1% – 80%
-    Lot dihitung agar margin aktual ≤ target (sedekat mungkin tanpa melebihi).
+    Set MAX_SL_LOSS_PCT — batas kerugian MAKSIMAL per trade jika SL kena,
+    dihitung sebagai % dari total balance.
+
+    Lot dihitung MUNDUR dari batas ini:
+      lot = (balance × MAX_SL_LOSS_PCT) / sl_distance
+    → SL dekat: lot lebih besar. SL jauh: lot lebih kecil.
+    → Kerugian aktual saat SL kena TIDAK AKAN MELEBIHI angka ini.
+
+    Contoh: /setmarginratio 1   → jika SL kena, max rugi 1% dari balance
+            /setmarginratio 2   → jika SL kena, max rugi 2% dari balance
+    Range  : 0.1% – 20%
     """
-    global MARGIN_RATIO
+    global MAX_SL_LOSS_PCT, MARGIN_RATIO
     if len(parts) < 2:
         try:
             bal = get_total_balance()
-            margin_usdt = bal * MARGIN_RATIO
-            bal_line = f"💰 Margin/trade saat ini: <b>{margin_usdt:.2f} USDT</b> (dari balance {bal:.2f})"
+            max_loss_usdt = bal * MAX_SL_LOSS_PCT
+            bal_line = (
+                f"💰 Max loss/trade saat ini: <b>{max_loss_usdt:.2f} USDT</b> "
+                f"(dari balance {bal:.2f})"
+            )
         except Exception:
             bal_line = ""
         send_telegram_raw(
             "⚠️ Format salah.\n"
-            "Gunakan: <code>/setmarginratio 6</code>\n"
-            "Contoh nilai: 3, 6, 10 (dalam persen margin per trade)\n"
-            f"Margin ratio saat ini: <b>{MARGIN_RATIO * 100:.2f}%</b> dari balance\n"
+            "Gunakan: <code>/setmarginratio 1</code>\n"
+            "Contoh nilai: 0.5, 1, 2 (dalam persen max SL loss per trade)\n"
+            f"Max SL loss saat ini: <b>{MAX_SL_LOSS_PCT * 100:.2f}%</b> dari balance\n"
             f"{bal_line}\n"
-            "ℹ️ Margin = modal yang dikunci Binance per posisi.\n"
-            "Lot disesuaikan agar margin tidak melebihi batas ini."
+            "ℹ️ Lot dihitung otomatis agar loss MAKSIMAL saat SL kena = angka ini.\n"
+            "ℹ️ SL dekat → lot lebih besar | SL jauh → lot lebih kecil."
         )
         return
 
     try:
         new_pct = float(parts[1].replace(",", "."))
     except ValueError:
-        send_telegram_raw("⚠️ Masukkan angka yang valid. Contoh: <code>/setmarginratio 6</code>")
+        send_telegram_raw("⚠️ Masukkan angka yang valid. Contoh: <code>/setmarginratio 1</code>")
         return
 
-    if not (1.0 <= new_pct <= 80.0):
+    if not (0.1 <= new_pct <= 20.0):
         send_telegram_raw(
-            "⚠️ Margin ratio harus antara <b>1%</b> sampai <b>80%</b>.\n"
-            "Disarankan: 3–15% untuk manajemen risiko yang sehat."
+            "⚠️ Max SL loss harus antara <b>0.1%</b> sampai <b>20%</b>.\n"
+            "Disarankan: 0.5–3% untuk manajemen risiko yang sehat."
         )
         return
 
-    old_pct    = MARGIN_RATIO * 100
-    MARGIN_RATIO = new_pct / 100.0
+    old_pct          = MAX_SL_LOSS_PCT * 100
+    MAX_SL_LOSS_PCT  = new_pct / 100.0
+    MARGIN_RATIO     = MAX_SL_LOSS_PCT   # alias
 
-    if new_pct <= 5.0:
-        risk_note = "🟢 Konservatif — margin kecil per trade"
-    elif new_pct <= 15.0:
+    if new_pct <= 1.0:
+        risk_note = "🟢 Konservatif — risiko kecil per trade"
+    elif new_pct <= 3.0:
         risk_note = "🟡 Moderat — standar risk management"
-    elif new_pct <= 30.0:
-        risk_note = "🟠 Agresif — hati-hati over-leverage"
+    elif new_pct <= 7.0:
+        risk_note = "🟠 Agresif — hati-hati drawdown"
     else:
         risk_note = "🔴 Sangat agresif — risiko tinggi!"
 
     try:
-        bal = get_total_balance()
-        margin_usdt = bal * MARGIN_RATIO
-        bal_line = f"💰 Margin/trade: <b>{margin_usdt:.2f} USDT</b> (dari balance {bal:.2f})"
+        bal           = get_total_balance()
+        max_loss_usdt = bal * MAX_SL_LOSS_PCT
+        bal_line      = (
+            f"💰 Max loss/trade: <b>{max_loss_usdt:.2f} USDT</b> "
+            f"(dari balance {bal:.2f})"
+        )
     except Exception:
         bal_line = ""
 
     send_telegram_raw(
-        f"✅ <b>Margin Ratio Per Trade Diubah</b>\n"
+        f"✅ <b>Max SL Loss Per Trade Diubah</b>\n"
         f"{'─'*34}\n"
         f"📉 Sebelum : <b>{old_pct:.2f}%</b>\n"
         f"📈 Sekarang: <b>{new_pct:.2f}%</b> dari total balance\n"
@@ -7869,10 +7899,12 @@ def cmd_setmarginratio(parts: list):
         f"{bal_line}\n"
         f"{risk_note}\n"
         f"{'─'*34}\n"
-        f"ℹ️ Lot dihitung agar margin tidak melebihi {new_pct:.1f}% balance.\n"
+        f"ℹ️ Lot dihitung mundur dari batas ini:\n"
+        f"   lot = (balance × {new_pct:.1f}%) ÷ jarak_SL\n"
+        f"ℹ️ Loss aktual saat SL kena ≤ {new_pct:.2f}% balance.\n"
         f"ℹ️ Berlaku untuk trade baru. Posisi aktif tidak berubah."
     )
-    print(f"⚙️ MARGIN_RATIO diubah: {old_pct:.2f}% → {new_pct:.2f}%")
+    print(f"⚙️ MAX_SL_LOSS_PCT diubah: {old_pct:.2f}% → {new_pct:.2f}%")
     save_state()
 
 
@@ -7972,7 +8004,7 @@ def cmd_setfixedlev(parts: list):
     FIXED_LEVERAGE = val
 
     old_str = f"{old}x (fixed)" if old > 0 else "auto-tier by price"
-    margin_note = f"📊 Margin/trade: <b>{MARGIN_RATIO*100:.1f}% dari total balance</b>"
+    margin_note = f"📊 Max SL/trade: <b>{MAX_SL_LOSS_PCT*100:.1f}% dari total balance</b>"
 
     send_telegram_raw(
         f"✅ <b>Fixed Leverage Set</b>\n"
@@ -7992,7 +8024,7 @@ def cmd_resetmm():
     """
     /resetmm
     Reset leverage fixed → kembali ke auto-tier by price.
-    MARGIN_RATIO tidak direset oleh command ini —
+    MAX_SL_LOSS_PCT tidak direset oleh command ini —
     gunakan /setmarginratio untuk mengubahnya.
     """
     global FIXED_LEVERAGE
@@ -8006,12 +8038,12 @@ def cmd_resetmm():
         f"🔄 <b>Leverage Reset ke Auto-Tier</b>\n"
         f"{'─'*34}\n"
         f"⚡ Leverage: {lev_was} → <b>auto-tier by price</b>\n"
-        f"📊 Margin : <b>{MARGIN_RATIO*100:.1f}% dari balance per trade</b> (tidak berubah)\n"
+        f"📊 Max SL : <b>{MAX_SL_LOSS_PCT*100:.1f}% dari balance per trade</b> (tidak berubah)\n"
         f"{'─'*34}\n"
         f"ℹ️ Bot kembali ke leverage otomatis berdasarkan harga pair.\n"
-        f"Gunakan /setmarginratio untuk ubah margin % per trade."
+        f"Gunakan /setmarginratio untuk ubah max SL loss % per trade."
     )
-    print(f"⚙️ MM reset: margin {was_margin:.2f}→0 | lev {was_lev}→0 (kembali dinamis)")
+    print(f"⚙️ MM reset: lev {was_lev}→0 (kembali dinamis)")
     save_state()
 
 
@@ -9323,8 +9355,9 @@ def handle_command(text: str):
             "/closeallposition\n"
             "  Tutup semua posisi aktif sekarang\n\n"
             "/setmarginratio &lt;persen&gt;\n"
-            "  Set margin % per trade (modal dikunci per posisi), contoh:\n"
-            "  <code>/setmarginratio 6</code>  → setiap trade pakai margin 6% dari balance\n\n"
+            "  Set max SL loss % per trade — kerugian maks jika SL kena.\n"
+            "  Lot dihitung mundur: lot = (balance × %) ÷ jarak_SL\n"
+            "  <code>/setmarginratio 1</code>  → jika SL kena, max rugi 1% dari balance\n\n"
             "/maxopentrade &lt;jumlah&gt;\n"
             "  Ubah max posisi yang boleh dibuka (1–20), contoh:\n"
             "  <code>/maxopentrade 3</code>\n\n"
@@ -10818,12 +10851,12 @@ def main():
         f"{'─'*38}\n"
         f"💼 Balance   : <b>{bal_str}</b>\n"
         f"🌐 Mode      : <b>{mode_em}</b>\n"
-        f"⚡ Margin/trade: <b>{MARGIN_RATIO*100:.1f}%</b> dari balance | Max: <b>{MAX_OPEN_TRADES}</b> trades\n"
+        f"⚡ Max SL/trade: <b>{MAX_SL_LOSS_PCT*100:.1f}%</b> dari balance | Max: <b>{MAX_OPEN_TRADES}</b> trades\n"
         f"{'─'*38}\n"
         f"⚠️ <b>Posisi belum di-sync</b> — sync akan dilakukan saat /start dikirim.\n"
         f"Pastikan mode sudah benar sebelum /start:\n"
         f"  /changeliveordemo — ganti LIVE/DEMO (saat ini: <b>{mode_em}</b>)\n"
-        f"  /setmarginratio — set margin % per trade\n"
+        f"  /setmarginratio — set max SL loss % per trade\n"
         f"  /maxopentrade — ubah max posisi\n"
         f"  /setfixedlev — leverage tetap untuk semua trade\n"
         f"  /resetmm — reset ke MM dinamis\n"
