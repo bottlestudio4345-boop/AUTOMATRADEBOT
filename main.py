@@ -1116,7 +1116,7 @@ active_positions = {}
 pending_limit_orders: dict = {}
 
 # Timeout limit order: batalkan jika tidak terisi dalam N menit
-LIMIT_ORDER_TIMEOUT_MINUTES: int = 90
+LIMIT_ORDER_TIMEOUT_MINUTES: int = 120
 
 DAILY_SUMMARY_HOUR_UTC = 0
 
@@ -2163,6 +2163,435 @@ def price_in_sd_zone(price: float, zones: list) -> tuple:
     # Pilih zona paling fresh (touches paling sedikit)
     best = min(candidates, key=lambda z: z["touches"])
     return True, best
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  PRE-ZONE SNIPER — Pasang Limit Order sebelum candle menyentuh zona
+#
+#  Filosofi:
+#    Bot sekarang nunggu harga SUDAH di zona → baru signal → limit order.
+#    Ini sering terlambat — entry terisi di harga yang sudah tidak optimal.
+#
+#    Dengan Pre-Zone Sniper:
+#    • Harga dalam PRE_ZONE_PROXIMITY_PCT (1.5%) dari zona 4H
+#    • Setup dievaluasi sekarang (score, RR, BOS, dll)
+#    • Jika oke → limit order langsung dipasang DI HARGA ZONA (zone_top untuk demand)
+#    • Order menunggu di sana → harga turun → terisi di harga terbaik (zona bawah)
+#    • Timeout ikut LIMIT_ORDER_TIMEOUT_MINUTES yang sudah ada
+#
+#  Keuntungan vs flow biasa:
+#    ✅ Entry lebih presisi — terisi di zona, bukan sesudah masuk
+#    ✅ SL lebih ketat — zona masih segar, struktur masih valid
+#    ✅ RR lebih baik — entry di harga zona, bukan sesudah bounce
+#
+#  Konfigurasi:
+#    PRE_ZONE_PROXIMITY_PCT = 0.015  → aktif jika harga dalam 1.5% dari zona
+#    PRE_ZONE_ALERT_TF      = "4h"   → hanya berlaku di TF 4 jam
+#    PRE_ZONE_COOLDOWN_SEC  = 14400  → cooldown 4 jam per pair per arah
+#
+#  Catatan:
+#    • Semua filter biasa tetap berlaku: BTC bias, slot, duplicate, RR min
+#    • Jika pair sudah ada di pending_limit_orders → skip (tidak double entry)
+#    • Limit order dipasang di zone_top (demand) atau zone_bottom (supply)
+#      agar terisi tepat di tepi zona yang paling kuat
+# ═══════════════════════════════════════════════════════════════════════════
+
+PRE_ZONE_PROXIMITY_PCT = 0.015   # aktif jika harga dalam 1.5% dari tepi zona
+PRE_ZONE_ALERT_TF      = "4h"    # timeframe yang dimonitor
+PRE_ZONE_COOLDOWN_SEC  = 14400   # cooldown 4 jam per pair per arah (= 1 candle 4H)
+
+_pre_zone_alerted: dict = {}     # {pair|direction: last_alert_unix_timestamp}
+
+
+def check_pre_zone_sniper(
+    pair:            str,
+    df_4h=None,
+    btc_bias:        str = "RANGING",
+    btc_allow_long:  bool = True,
+    btc_allow_short: bool = True,
+    session:         str  = "Off-Hours",
+    signal_candidates: list = None,
+):
+    """
+    Pre-Zone Sniper — evaluasi setup dan pasang limit order saat harga
+    mendekati zona Demand/Supply di TF 4H, SEBELUM candle menyentuh zona.
+
+    Alur:
+      1. Fetch/pakai data 4H
+      2. Untuk setiap arah (BULLISH/BEARISH):
+         a. Cari zona fresh (find_supply_demand_zones)
+         b. Cek apakah harga dalam PRE_ZONE_PROXIMITY_PCT dari zona
+         c. Evaluasi score & RR (pakai OB/FVG dari 4H)
+         d. Jika score >= threshold dan RR >= RR_MIN → execute_trade
+            dengan entry = zone_top (demand) atau zone_bottom (supply)
+      3. Cooldown per pair per arah 4 jam agar tidak spam
+
+    Parameter:
+      pair            : simbol pair
+      df_4h           : DataFrame 4H (opsional, di-fetch jika None)
+      btc_bias        : bias BTC dari analyze_btc_multitf
+      btc_allow_long  : dari btc_mtf.allow_long
+      btc_allow_short : dari btc_mtf.allow_short
+      session         : sesi trading saat ini
+      signal_candidates: list untuk collect sinyal (opsional, bisa None)
+    """
+    global _pre_zone_alerted
+
+    # ── Guard: skip jika bot paused atau AUTO_TRADING off ───────────────────
+    if bot_paused or not AUTO_TRADING:
+        return
+
+    # ── Guard: skip jika pair sudah punya posisi atau pending order ─────────
+    if has_position(pair) or pair in pending_limit_orders:
+        return
+
+    now_ts = time.time()
+
+    try:
+        # ── Fetch data 4H jika belum di-cache ───────────────────────────────
+        if df_4h is None:
+            df_4h = fetch_ohlcv_realdata(pair, PRE_ZONE_ALERT_TF, limit=120)
+        if df_4h is None or len(df_4h) < 30:
+            return
+
+        current_price = float(df_4h["close"].iloc[-1])
+        atr_4h        = calculate_atr(df_4h)
+
+        # ── Hitung komponen scoring dari 4H ─────────────────────────────────
+        trend_4h, bos_type_4h, last_sh_4h, last_sl_4h = detect_structure(df_4h)
+        bos_confirmed = bos_type_4h == "BOS"
+        bos_strength  = "STRONG" if bos_confirmed else "WEAK"
+
+        # Volume ratio
+        vol_series = df_4h["volume"].astype(float)
+        avg_vol    = vol_series.iloc[-20:-1].mean() if len(vol_series) > 20 else vol_series.mean()
+        cur_vol    = float(vol_series.iloc[-1])
+        vol_rat    = cur_vol / avg_vol if avg_vol > 0 else 1.0
+
+        # RSI dari 4H
+        closes_4h = df_4h["close"].astype(float)
+        delta_rsi  = closes_4h.diff()
+        gain_rsi   = delta_rsi.clip(lower=0).ewm(com=13, min_periods=14).mean()
+        loss_rsi   = (-delta_rsi.clip(upper=0)).ewm(com=13, min_periods=14).mean()
+        rs_4h      = gain_rsi / loss_rsi.replace(0, 1e-9)
+        rsi_4h     = float((100 - 100 / (1 + rs_4h)).iloc[-1])
+        if pd.isna(rsi_4h): rsi_4h = 50.0
+
+        sr_levels  = find_sr_levels(df_4h)
+
+        for direction in ["BULLISH", "BEARISH"]:
+            alert_key = f"{pair}|{direction}"
+
+            # ── Cooldown check ───────────────────────────────────────────────
+            last_ts = _pre_zone_alerted.get(alert_key, 0)
+            if (now_ts - last_ts) < PRE_ZONE_COOLDOWN_SEC:
+                continue
+
+            # ── Filter BTC bias ──────────────────────────────────────────────
+            if direction == "BULLISH" and not btc_allow_long:
+                continue
+            if direction == "BEARISH" and not btc_allow_short:
+                continue
+            if btc_bias == "RANGING":
+                continue
+
+            # ── Cari zona fresh ──────────────────────────────────────────────
+            zones = find_supply_demand_zones(df_4h, direction)
+            if not zones:
+                continue
+
+            # ── Filter zona: harus di luar harga (belum tersentuh saat ini) ──
+            if direction == "BULLISH":
+                # Demand zone: zone_top harus di BAWAH harga saat ini
+                valid_zones = [z for z in zones if z["top"] < current_price]
+                valid_zones.sort(key=lambda z: current_price - z["top"])  # paling dekat dulu
+            else:
+                # Supply zone: zone_bottom harus di ATAS harga saat ini
+                valid_zones = [z for z in zones if z["bottom"] > current_price]
+                valid_zones.sort(key=lambda z: z["bottom"] - current_price)
+
+            if not valid_zones:
+                continue
+
+            # Ambil zona paling dekat + paling fresh
+            closest = min(valid_zones[:3], key=lambda z: z["touches"])
+            zone_top    = closest["top"]
+            zone_bottom = closest["bottom"]
+
+            # ── Cek proximity: harga dalam PRE_ZONE_PROXIMITY_PCT dari zona ──
+            if direction == "BULLISH":
+                dist_pct = (current_price - zone_top) / (zone_top + 1e-9)
+            else:
+                dist_pct = (zone_bottom - current_price) / (zone_bottom + 1e-9)
+
+            if not (0.0 < dist_pct <= PRE_ZONE_PROXIMITY_PCT):
+                continue
+
+            # ── Hitung entry, SL, TP dari zona ──────────────────────────────
+            # Entry: di tepi zona (zone_top untuk demand, zone_bottom untuk supply)
+            # Ini memastikan limit order terisi tepat saat harga menyentuh zona
+            buf = atr_4h * 0.3
+
+            if direction == "BULLISH":
+                # Entry di zone_top (tepi atas zona demand) — paling dekat ke harga
+                # SL di bawah zone_bottom + buffer
+                entry  = zone_top
+                sl_raw = zone_bottom - buf
+                # TP: swing high di atas entry
+                highs_4h, lows_4h = find_swings(df_4h)
+                highs_above = sorted(
+                    [(i, p) for i, p in highs_4h if p > entry + atr_4h * 0.5],
+                    key=lambda x: x[1]
+                )
+                sl_dist = entry - sl_raw
+                tp1_raw = None
+                for _, sh in highs_above:
+                    cand = sh - buf * 0.5
+                    if (cand - entry) >= sl_dist * RR_MIN:
+                        tp1_raw = cand
+                        break
+                if tp1_raw is None:
+                    continue   # tidak ada TP struktural valid → skip
+
+                tp2_raw = None
+                for _, sh in highs_above:
+                    cand = sh - buf * 0.5
+                    if cand > tp1_raw + atr_4h * 0.3 and (cand - entry) >= sl_dist * RR_GRADE_A:
+                        tp2_raw = cand
+                        break
+                if tp2_raw is None:
+                    tp2_raw = tp1_raw + (tp1_raw - entry) * 0.5
+
+            else:
+                # Entry di zone_bottom (tepi bawah zona supply)
+                # SL di atas zone_top + buffer
+                entry  = zone_bottom
+                sl_raw = zone_top + buf
+                highs_4h, lows_4h = find_swings(df_4h)
+                lows_below = sorted(
+                    [(i, p) for i, p in lows_4h if p < entry - atr_4h * 0.5],
+                    key=lambda x: x[1], reverse=True
+                )
+                sl_dist = sl_raw - entry
+                tp1_raw = None
+                for _, sl_p in lows_below:
+                    cand = sl_p + buf * 0.5
+                    if (entry - cand) >= sl_dist * RR_MIN:
+                        tp1_raw = cand
+                        break
+                if tp1_raw is None:
+                    continue
+
+                tp2_raw = None
+                for _, sl_p in lows_below:
+                    cand = sl_p + buf * 0.5
+                    if cand < tp1_raw - atr_4h * 0.3 and (entry - cand) >= sl_dist * RR_GRADE_A:
+                        tp2_raw = cand
+                        break
+                if tp2_raw is None:
+                    tp2_raw = tp1_raw - (entry - tp1_raw) * 0.5
+
+            sl  = sl_raw
+            tp1 = tp1_raw
+            tp2 = tp2_raw
+
+            # ── Validasi SL distance ─────────────────────────────────────────
+            sl_dist_abs = abs(entry - sl)
+            sl_dist_pct = sl_dist_abs / (entry + 1e-9)
+            max_sl_pct  = SL_TP_CAPS.get("SCALPING", (0.04, 0.08))[0]   # pakai cap SCALPING untuk 4H
+            if sl_dist_pct > max_sl_pct:
+                continue
+            if sl_dist_pct < MIN_SL_DISTANCE_PCT:
+                sl = (entry - entry * MIN_SL_DISTANCE_PCT) if direction == "BULLISH" else (entry + entry * MIN_SL_DISTANCE_PCT)
+                sl_dist_abs = abs(entry - sl)
+
+            # ── Hitung RR ───────────────────────────────────────────────────
+            rr1 = round(abs(tp1 - entry) / sl_dist_abs, 2) if sl_dist_abs > 0 else 0.0
+            rr2 = round(abs(tp2 - entry) / sl_dist_abs, 2) if sl_dist_abs > 0 else 0.0
+            if rr1 < RR_MIN:
+                continue
+
+            # ── Cek in_ob / in_fvg untuk scoring ────────────────────────────
+            ob_4h  = detect_order_block(df_4h, direction)
+            fvg_4h = detect_fvg(df_4h, direction)
+            in_ob  = ob_4h is not None and ob_4h.get("low") is not None
+            in_fvg = fvg_4h is not None and fvg_4h.get("bottom") is not None
+
+            # Momentum: berapa candle berturut searah arah
+            last5         = df_4h.iloc[-5:]
+            bull_c        = sum(1 for _, r in last5.iterrows() if float(r["close"]) > float(r["open"]))
+            bear_c        = 5 - bull_c
+            mom_aligned   = (bull_c >= 3 if direction == "BULLISH" else bear_c >= 3)
+            mom_present   = (bull_c >= 2 if direction == "BULLISH" else bear_c >= 2)
+
+            # Liquidity sweep
+            liq_swept, sweep_str = detect_liquidity_sweep(df_4h, direction)
+
+            # HTF alignment: cek 1D jika tersedia, pakai 4H sendiri sebagai fallback
+            htf_aligned = (trend_4h == direction)
+
+            # Displacement
+            displacement = False
+            if len(df_4h) >= 3:
+                last3 = df_4h.iloc[-3:]
+                for _, row in last3.iterrows():
+                    body = abs(float(row["close"]) - float(row["open"]))
+                    rng  = float(row["high"]) - float(row["low"])
+                    if rng > 0 and body / rng > 0.7 and body > atr_4h * 1.2:
+                        displacement = True
+                        break
+
+            # Macro pts dari BTC bias
+            btc_pts = 0
+            if direction == "BULLISH" and btc_bias == "BULLISH":
+                btc_pts = SCORE_MACRO_ALIGNED
+            elif direction == "BEARISH" and btc_bias == "BEARISH":
+                btc_pts = SCORE_MACRO_ALIGNED
+            elif btc_bias == "RANGING":
+                btc_pts = -5
+
+            # EMA pts
+            ema_pts = 0
+            if len(closes_4h) >= 50:
+                ema20 = float(closes_4h.ewm(span=20, adjust=False).mean().iloc[-1])
+                ema50 = float(closes_4h.ewm(span=50, adjust=False).mean().iloc[-1])
+                if direction == "BULLISH" and current_price > ema20 > ema50:
+                    ema_pts = 5
+                elif direction == "BEARISH" and current_price < ema20 < ema50:
+                    ema_pts = 5
+
+            # ── Compute score ────────────────────────────────────────────────
+            score, breakdown = compute_score(
+                htf_aligned     = htf_aligned,
+                bos_confirmed   = bos_confirmed,
+                bos_strength    = bos_strength,
+                momentum_aligned= mom_aligned,
+                momentum_present= mom_present,
+                liq_swept       = bool(liq_swept),
+                sweep_strength  = sweep_str if liq_swept else None,
+                in_ob           = in_ob,
+                in_fvg          = in_fvg,
+                displacement    = displacement,
+                vol_rat         = vol_rat,
+                session         = session,
+                rsi             = rsi_4h,
+                macro_pts       = btc_pts,
+                ema_pts         = ema_pts,
+                direction       = direction,
+            )
+
+            # ── Bonus: zona fresh di discount/premium ───────────────────────
+            try:
+                recent_high = float(df_4h["high"].iloc[-50:].max())
+                recent_low  = float(df_4h["low"].iloc[-50:].min())
+                eq          = (recent_high + recent_low) / 2.0
+                if direction == "BULLISH" and entry < eq:
+                    score += SCORE_ZONE_CONFLUENCE_PD_ARRAY
+                elif direction == "BEARISH" and entry > eq:
+                    score += SCORE_ZONE_CONFLUENCE_PD_ARRAY
+            except Exception:
+                pass
+
+            # ── Bonus: zona fresh (touches==0) ──────────────────────────────
+            if closest["touches"] == 0:
+                score += 5   # virgin zone bonus
+            elif closest["touches"] == 1:
+                score += 2   # tested once bonus
+
+            # ── Threshold check: pakai MIN_SCORE_CUSTOM atau fallback ────────
+            min_score_threshold = MIN_SCORE_CUSTOM if MIN_SCORE_CUSTOM > 0 else MIN_SCORE
+            if score < min_score_threshold:
+                print(f"  📊 PRE-ZONE [{pair} {direction}] score={score} < {min_score_threshold} → skip")
+                continue
+
+            # ── Grade ────────────────────────────────────────────────────────
+            if score >= 80:   grade = "S"
+            elif score >= 70: grade = "A"
+            elif score >= 60: grade = "B"
+            else:             grade = "C"
+
+            # ── Duplicate check ─────────────────────────────────────────────
+            if _is_duplicate_signal(pair, direction, entry, sl):
+                continue
+
+            # ── Cek slot tersedia ────────────────────────────────────────────
+            _cur_open  = count_open_positions() + len(pending_limit_orders)
+            _dyn_max   = get_dynamic_max_trades()
+            if _cur_open >= _dyn_max:
+                print(f"  📛 PRE-ZONE [{pair}] slot penuh ({_cur_open}/{_dyn_max}) — skip")
+                continue
+
+            # ── Build signal dict (format sama dengan analyze_pair) ──────────
+            _dir_str = "LONG" if direction == "BULLISH" else "SHORT"
+            signal = {
+                "pair":       pair,
+                "direction":  _dir_str,
+                "entry":      entry,
+                "stop_loss":  sl,
+                "tp1":        tp1,
+                "tp2":        tp2,
+                "rr":         rr1,
+                "rr2":        rr2,
+                "score":      score,
+                "grade":      grade,
+                "pattern":    "Pre-Zone Sniper 4H",
+                "breakdown":  breakdown,
+                "sd_zone":    closest,
+                "mode":       "PRE_ZONE",
+            }
+
+            mode_dict = {
+                "label":    "SCALPING",   # usar caps de SCALPING para SL/TP
+                "htf_tf":   "4h",
+                "entry_tf": "4h",
+                "ref_tf":   None,
+                "tier":     "FULL",
+            }
+
+            dist_display = round(dist_pct * 100, 2)
+            freshness    = "🟢 VIRGIN" if closest["touches"] == 0 else f"🟡 TESTED {closest['touches']}x"
+
+            def _fz(p):
+                if p < 0.0001:  return f"{p:.8f}"
+                if p < 0.01:    return f"{p:.6f}"
+                if p < 1:       return f"{p:.5f}"
+                if p < 100:     return f"{p:.4f}"
+                return f"{p:.2f}"
+
+            dir_em   = "🟢" if direction == "BULLISH" else "🔴"
+            zone_lbl = "DEMAND" if direction == "BULLISH" else "SUPPLY"
+
+            # Notif ke Telegram sebelum eksekusi
+            send_telegram_raw(
+                f"🎯 <b>PRE-ZONE SNIPER [4H] — {pair}</b>\n"
+                f"{'─'*36}\n"
+                f"{dir_em} Arah       : <b>{_dir_str} ({zone_lbl})</b>\n"
+                f"💰 Harga kini: <code>{_fz(current_price)}</code>\n"
+                f"📦 Zone      : {_fz(zone_bottom)} — {_fz(zone_top)}\n"
+                f"📏 Jarak zona: <b>{dist_display}%</b> | {freshness}\n"
+                f"{'─'*36}\n"
+                f"🔢 Entry Limit: <b>{_fz(entry)}</b>\n"
+                f"🛑 Stop Loss  : <b>{_fz(sl)}</b>\n"
+                f"🎯 TP1        : <b>{_fz(tp1)}</b>\n"
+                f"🎯 TP2        : <b>{_fz(tp2)}</b>\n"
+                f"📊 RR         : 1:{rr1} | Score: <b>{score}</b> [{grade}]\n"
+                f"{'─'*36}\n"
+                f"⏳ Memasang limit order di zona..."
+            )
+
+            print(f"  🎯 PRE-ZONE SNIPER → {pair} {_dir_str} | Entry={_fz(entry)} | Score={score} | RR=1:{rr1} | Dist={dist_display}%")
+
+            # ── Eksekusi: pasang limit order di harga zona ───────────────────
+            execute_trade(signal, mode_dict)
+            _register_signal_hash(pair, direction, entry, sl)
+            _pre_zone_alerted[alert_key] = now_ts
+            save_state()
+
+            # Hanya satu arah per pair per scan untuk menghindari overload
+            break
+
+    except Exception as e:
+        print(f"  ⚠️  check_pre_zone_sniper error [{pair}]: {e}")
 
 
 def find_sr_levels(df: pd.DataFrame) -> list:
@@ -10998,7 +11427,11 @@ def main():
 
             def process_pair(pair):
                 tf_cache = {}
-                all_tfs  = list(set(htf_tfs_active + ref_tfs_needed))
+                # Pastikan 4H selalu di-fetch untuk Pre-Zone Sniper,
+                # meski mode aktif hanya scalping (15m/30m).
+                all_tfs = list(set(htf_tfs_active + ref_tfs_needed + ["4h"]))
+                if "4h" not in _TF_LIMIT_MAP:
+                    _TF_LIMIT_MAP["4h"] = 120
                 for tf in all_tfs:
                     try:
                         limit = _TF_LIMIT_MAP.get(tf, 150)
@@ -11007,6 +11440,23 @@ def main():
                     except Exception as e:
                         print(f"  ⚠️  {pair} @ {tf}: {e}")
                         tf_cache[tf] = None
+
+                # ── PRE-ZONE SNIPER: evaluasi setup & pasang limit di zona 4H ──
+                # Dipanggil SEBELUM analyze_pair biasa.
+                # Menggunakan data 4H yang sudah di-cache untuk efisiensi.
+                # Jika setup oke (score + RR terpenuhi) → langsung execute_trade
+                # dengan entry = zone_top/bottom sehingga terisi saat harga menyentuh zona.
+                try:
+                    check_pre_zone_sniper(
+                        pair            = pair,
+                        df_4h           = tf_cache.get("4h"),
+                        btc_bias        = btc_bias,
+                        btc_allow_long  = btc_mtf.allow_long,
+                        btc_allow_short = btc_mtf.allow_short,
+                        session         = session,
+                    )
+                except Exception as _pzs_err:
+                    print(f"  ⚠️  pre_zone_sniper [{pair}]: {_pzs_err}")
 
                 local_candidates = []
                 for mode in _active_modes:
