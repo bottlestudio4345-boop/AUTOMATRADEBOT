@@ -10772,7 +10772,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             if trade_direction == "BULLISH" and _pair_ob:
                 print(
                     f"  🚫 [{label}] {pair} LONG — PAIR HTF STOCH GATE: "
-                    f"H4 Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
+                    f"{htf_tf} Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
                     f"overbought, tunggu stoch turun dulu"
                 )
                 return
@@ -10780,7 +10780,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             if trade_direction == "BEARISH" and _pair_os:
                 print(
                     f"  🚫 [{label}] {pair} SHORT — PAIR HTF STOCH GATE: "
-                    f"H4 Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
+                    f"{htf_tf} Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
                     f"oversold, seller exhausted, hindari short"
                 )
                 return
