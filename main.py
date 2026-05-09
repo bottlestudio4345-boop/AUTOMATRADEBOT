@@ -10755,6 +10755,40 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         print(f"  🥇 [{label}] {pair} — GOLD exempt dari BTC filter (analisa independen)")
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── PAIR HTF STOCHASTIC GATE — Hard Block ────────────────────────────────
+    # Stoch RSI 5,3,3 pada HTF pair itu sendiri (bukan BTC).
+    # Kalau stoch pair H4 masih OVERBOUGHT → LONG diblok (harga butuh cooling dulu)
+    # Kalau stoch pair H4 sudah OVERSOLD   → SHORT diblok (seller exhausted)
+    # Ini adalah major block — bukan penalty, langsung return.
+    # Logika: probabilitas jauh lebih rendah kalau entry berlawanan momentum stoch HTF.
+    if HTF_STOCH_GATE_ENABLED:
+        try:
+            _pair_k, _pair_d = calc_stoch_rsi(df_htf, rsi_len=5, stoch_len=5, k_smooth=3, d_smooth=3)
+            _pair_h4_state   = get_stoch_rsi_state(_pair_k, _pair_d)
+
+            _pair_ob = _pair_h4_state in ("OVERBOUGHT", "CROSSING_DOWN") and _pair_k > 60
+            _pair_os = _pair_h4_state in ("OVERSOLD", "CROSSING_UP")     and _pair_k < 40
+
+            if trade_direction == "BULLISH" and _pair_ob:
+                print(
+                    f"  🚫 [{label}] {pair} LONG — PAIR HTF STOCH GATE: "
+                    f"H4 Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
+                    f"overbought, tunggu stoch turun dulu"
+                )
+                return
+
+            if trade_direction == "BEARISH" and _pair_os:
+                print(
+                    f"  🚫 [{label}] {pair} SHORT — PAIR HTF STOCH GATE: "
+                    f"H4 Stoch {_pair_h4_state} (K={_pair_k:.1f}/D={_pair_d:.1f}) → "
+                    f"oversold, seller exhausted, hindari short"
+                )
+                return
+
+        except Exception:
+            pass  # kalau stoch gagal dihitung → lanjut normal, jangan blok
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── MARKET REGIME HARDBLOCK — BTC EMA + BTCD EMA ─────────────────────────
     # Layer pertahanan paling awal, sebelum apapun diproses:
     #   BULL_REGIME (BTC EMA↑ + BTCD EMA↓) → SHORT alt DIBLOK total
@@ -10932,6 +10966,65 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         m_pts = m_pts + _btc_mtf_bonus
         if _btc_mtf_notes:
             macro_reason = macro_reason + " | BTC MTF: " + ", ".join(_btc_mtf_notes)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 4a.5 — PAIR HTF DIVERGENCE + POST-BREAKOUT CONSOLIDATION DETECTOR
+    #
+    # Teknik analisa universal (berlaku semua pair):
+    #   Setup: Harga breakout dari S/R di HTF → konsolidasi sempit
+    #          → Stoch RSI turun tapi harga tidak turun (bullish divergence)
+    #          → Continuation pump tinggi probabilitas
+    #
+    # Scoring:
+    #   BULLISH_DIV di HTF pair sendiri              → +8 pts
+    #   + Post-breakout consolidation terdeteksi     → +5 pts tambahan (total +13)
+    #   BEARISH_DIV di HTF pair saat ambil LONG      → -6 pts (waspada)
+    #   BEARISH_DIV di HTF pair saat ambil SHORT     → +6 pts (konfirmasi short)
+    #   BULLISH_DIV di HTF pair saat ambil SHORT     → -6 pts (waspada)
+    # ─────────────────────────────────────────────────────────────────────────
+    _pair_div_bonus = 0
+    _pair_div_notes = []
+
+    try:
+        pair_htf_div = detect_divergence(df_htf, lookback=40)
+
+        # Divergence = conviction booster saja, bukan penentu atau blocker.
+        # Searah trade → bonus. Berlawanan atau tidak ada → 0, tidak minus.
+        if trade_direction == "BULLISH" and pair_htf_div == "BULLISH_DIV":
+            _pair_div_bonus += 8
+            _pair_div_notes.append("HTF Pair Bullish Div → conviction long +8")
+
+            # ── Post-Breakout Consolidation check ────────────────────────────
+            # Ciri: range 12 candle HTF terakhir sempit + harga bertahan di atas
+            # Kombinasi div + konsolidasi = setup continuation high-probability
+            try:
+                _htf_last     = df_htf.iloc[-12:]
+                _rng          = float(_htf_last["high"].max()) - float(_htf_last["low"].min())
+                _avg_body     = (_htf_last["high"].astype(float) - _htf_last["low"].astype(float)).mean()
+                _is_tight     = _rng <= _avg_body * 2.5
+                _cur_close    = float(df_htf["close"].iloc[-1])
+                _htf_low      = float(_htf_last["low"].min())
+                _htf_high     = float(_htf_last["high"].max())
+                _pos_in_range = (_cur_close - _htf_low) / (_htf_high - _htf_low + 1e-9)
+                if _is_tight and _pos_in_range >= 0.50:
+                    _pair_div_bonus += 5
+                    _pair_div_notes.append("Post-Breakout Consolidation +5")
+            except Exception:
+                pass
+
+        elif trade_direction == "BEARISH" and pair_htf_div == "BEARISH_DIV":
+            _pair_div_bonus += 6
+            _pair_div_notes.append("HTF Pair Bearish Div → conviction short +6")
+
+    except Exception:
+        pass  # divergence gagal hitung → skip, tidak pengaruhi sinyal
+
+    if _pair_div_bonus != 0:
+        m_pts = m_pts + _pair_div_bonus
+        if _pair_div_notes:
+            macro_reason = macro_reason + " | PairDiv: " + ", ".join(_pair_div_notes)
+            dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
+            print(f"  📐 [{label}] {pair} {dir_str} — Pair HTF Div: {' | '.join(_pair_div_notes)}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 4b — BTC/BTCD LTF CORRELATION FILTER
