@@ -3881,6 +3881,48 @@ def analyze_btc_multitf() -> BtcMultiTfResult:
             if h1_state == "OVERBOUGHT":
                 reasons.append(f"✅ H1 Stoch OVERBOUGHT (K={h1_k:.1f}) — pullback selesai, entry timing OK")
 
+        # ── HTF STOCHASTIC GATE ───────────────────────────────────────────────
+        # Kalau H4 Stoch masih OVERBOUGHT / CROSSING_DOWN → probabilitas turun dulu tinggi
+        # → blok LONG, buka SHORT. Kalau sudah OVERSOLD / CROSSING_UP → sebaliknya.
+        # Gate ini TIDAK bergantung pada daily_bias — murni berdasarkan momentum stoch.
+        if HTF_STOCH_GATE_ENABLED:
+            _h4_ob = h4_state in ("OVERBOUGHT", "CROSSING_DOWN") and h4_k > 60
+            _h4_os = h4_state in ("OVERSOLD", "CROSSING_UP") and h4_k < 40
+
+            if _h4_ob:
+                # H4 overbought / crossing down — jangan ambil LONG dulu
+                allow_long = False
+                reasons.append(
+                    f"🚫 HTF Stoch Gate: H4 {h4_state} (K={h4_k:.1f}) → LONG DIBLOK "
+                    f"(tunggu stoch turun ke support dulu)"
+                )
+                # Kalau arah daily juga bullish tapi stoch sudah puncak → izinkan short
+                # (ini setup favorite: stoch overbought mau crossing down)
+                if h4_k > d_d and (h4_k - h4_d) < 5:
+                    # K ≈ D atau K mulai di bawah D = crossing terjadi
+                    allow_short = True
+                    reasons.append(
+                        f"✅ HTF Stoch Gate: K({h4_k:.1f})≈D({h4_d:.1f}) crossing down → SHORT diizinkan"
+                    )
+                elif h4_state == "OVERBOUGHT":
+                    allow_short = True
+                    reasons.append(
+                        f"✅ HTF Stoch Gate: H4 OVERBOUGHT → SHORT diizinkan (fade momentum)"
+                    )
+
+            elif _h4_os:
+                # H4 oversold / crossing up — jangan ambil SHORT dulu
+                allow_short = False
+                reasons.append(
+                    f"🚫 HTF Stoch Gate: H4 {h4_state} (K={h4_k:.1f}) → SHORT DIBLOK "
+                    f"(tunggu konfirmasi reversal naik / harga di support)"
+                )
+                if h4_state in ("CROSSING_UP", "OVERSOLD"):
+                    allow_long = True
+                    reasons.append(
+                        f"✅ HTF Stoch Gate: H4 OVERSOLD+crossing → LONG diizinkan (reversal setup)"
+                    )
+
         reason_str = " | ".join(reasons)
 
         result = BtcMultiTfResult(
@@ -8735,7 +8777,48 @@ def cmd_togglebtcfilter():
     save_state()
 
 
-def cmd_setscoreupto(parts: list):
+def cmd_togglehtfstochgate():
+    """
+    /togglehtfstochgate
+    Toggle HTF Stochastic Gate ON/OFF.
+
+    Saat ON (default):
+      H4 Stoch OVERBOUGHT / CROSSING_DOWN (K>60) → LONG diblok, SHORT diutamakan
+      H4 Stoch OVERSOLD / CROSSING_UP    (K<40) → SHORT diblok, LONG diutamakan
+
+    Ini memastikan bot tidak ambil LONG di puncak stochastic atau
+    SHORT di dasar stochastic — sesuai analisa chart HIGH TIMEFRAME.
+    """
+    global HTF_STOCH_GATE_ENABLED
+    HTF_STOCH_GATE_ENABLED = not HTF_STOCH_GATE_ENABLED
+    state_em = "✅ ON" if HTF_STOCH_GATE_ENABLED else "⭕ OFF"
+
+    if HTF_STOCH_GATE_ENABLED:
+        detail = (
+            f"\n{'─'*38}\n"
+            f"📌 <b>Logika HTF Stoch Gate (H4 Stoch 5,3,3):</b>\n"
+            f"  H4 OVERBOUGHT / Crossing Down → <b>LONG DIBLOK</b>  🚫\n"
+            f"  H4 OVERBOUGHT / Crossing Down → <b>SHORT OK</b>    ✅\n"
+            f"  H4 OVERSOLD   / Crossing Up   → <b>SHORT DIBLOK</b> 🚫\n"
+            f"  H4 OVERSOLD   / Crossing Up   → <b>LONG OK</b>     ✅\n"
+            f"  H4 NEUTRAL                    → <b>Ikut bias daily</b> ⚖️\n"
+            f"\n⚡ Setup favorit: H4 stoch overbought + crossing down → short!\n"
+            f"⚡ Setup favorit: H4 stoch oversold + di support → long!\n"
+        )
+    else:
+        detail = "\n\nℹ️ HTF Stoch tidak memblok arah sinyal — bot ikut bias daily saja."
+
+    send_telegram_raw(
+        f"📊 <b>HTF Stochastic Gate</b>\n"
+        f"{'─'*38}\n"
+        f"Status : <b>{state_em}</b>\n"
+        f"TF Gate: <b>H4 Stochastic RSI 5,3,3</b>"
+        f"{detail}"
+    )
+    print(f"⚙️ HTF_STOCH_GATE_ENABLED → {HTF_STOCH_GATE_ENABLED}")
+    save_state()
+
+
     """
     /setscoreupto <score>
     Set batas minimum score sinyal yang akan dieksekusi bot.
@@ -9934,6 +10017,8 @@ def handle_command(text: str):
         cmd_setscoreupto(parts)
     elif cmd == "/togglebtcfilter":
         cmd_togglebtcfilter()
+    elif cmd == "/togglehtfstochgate":
+        cmd_togglehtfstochgate()
     elif cmd == "/resetpnl":
         cmd_resetpnl()
     elif cmd == "/backtest":
@@ -10013,6 +10098,11 @@ def handle_command(text: str):
             "  Toggle filter korelasi BTC + BTC.D ON/OFF (satu command)\n"
             "  ON: kombinasi arah BTC price + BTC.D menentukan sinyal lolos\n"
             "  Contoh: BTC↑ Dom↓ → LONG alt | BTC↓ Dom↑ → SHORT alt\n\n"
+            "/togglehtfstochgate\n"
+            "  Toggle HTF Stochastic Gate ON/OFF\n"
+            "  ON: H4 Stoch overbought → LONG diblok (prefer short)\n"
+            "      H4 Stoch oversold   → SHORT diblok (prefer long di support)\n"
+            "  Probabilitas tinggi: entry searah momentum stoch H4!\n\n"
             "/resetpnl\n"
             "  Reset PnL kumulatif mode aktif (LIVE atau DEMO)\n\n"
             "/backtest &lt;SYMBOL&gt; &lt;TF&gt; [DAYS]\n"
@@ -11319,6 +11409,14 @@ EXHAUSTION_STOCH_THRESHOLD = 78   # %K di atas ini = overbought zone
 EXHAUSTION_STOCH_D_GAP     = 5    # %K - %D < 5 dan mengecil = momentum melemah
 EXHAUSTION_ENABLED         = True # toggle on/off
 
+# ── HTF STOCHASTIC GATE ──────────────────────────────────────────────────────
+# Logika: Kalau Stoch H4/Daily masih OVERBOUGHT atau CROSSING_DOWN di atas 50,
+#   → LONG diblok, SHORT diutamakan (probabilitas lebih tinggi untuk turun dulu)
+# Kalau Stoch H4/Daily sudah OVERSOLD atau CROSSING_UP di bawah 50,
+#   → SHORT diblok, LONG diutamakan (setup long probabilitas tinggi)
+# Toggle: /togglehtfstochgate via Telegram (atau set di sini)
+HTF_STOCH_GATE_ENABLED = True   # True = aktif | False = disable gate ini
+
 
 def is_rally_exhausted() -> tuple:
     """
@@ -11693,6 +11791,18 @@ def main():
             exhaustion_mode, exhaustion_reason = is_rally_exhausted()
             if exhaustion_mode:
                 print(f"⛽ RALLY EXHAUSTION DETECTED — sinyal LONG akan diblok\n   {exhaustion_reason}")
+
+            # ── HTF Stochastic Gate status log ────────────────────────────────
+            if HTF_STOCH_GATE_ENABLED:
+                _h4s = btc_mtf.h4_stoch_state
+                _h4k = btc_mtf.h4_stoch_k
+                _h4d = btc_mtf.h4_stoch_d
+                if _h4s in ("OVERBOUGHT", "CROSSING_DOWN") and _h4k > 60:
+                    print(f"📊 HTF STOCH GATE: H4 {_h4s} (K={_h4k:.1f}/D={_h4d:.1f}) → 🚫 LONG DIBLOK, ✅ SHORT diutamakan")
+                elif _h4s in ("OVERSOLD", "CROSSING_UP") and _h4k < 40:
+                    print(f"📊 HTF STOCH GATE: H4 {_h4s} (K={_h4k:.1f}/D={_h4d:.1f}) → ✅ LONG diutamakan, 🚫 SHORT DIBLOK")
+                else:
+                    print(f"📊 HTF STOCH GATE: H4 {_h4s} (K={_h4k:.1f}/D={_h4d:.1f}) → ⚖️ Neutral, ikut bias daily")
 
             # OPT: limit candle per TF — HTF & ref cukup 150, hemat ~40% data transfer
             _TF_LIMIT_MAP = {tf: 150 for tf in htf_tfs_active}
