@@ -1117,10 +1117,10 @@ _INTERVAL_MAP = {
 
 # OPT: Global rate limiter — batasi max request Binance yang berjalan BERSAMAAN
 # Tanpa ini, 3 thread × 5 TF bisa kirim 15 request hampir serentak → 418
-# Semaphore(2): max 2 request berjalan paralel — lebih konservatif, hindari 418
-_BINANCE_SEMAPHORE = threading.Semaphore(2)
+# Semaphore(1): max 1 request berjalan paralel — paling konservatif, hindari 418
+_BINANCE_SEMAPHORE = threading.Semaphore(1)
 # Jeda minimum antar request (detik) — jaga jarak biar tidak dianggap burst
-_BINANCE_REQ_DELAY = 0.3
+_BINANCE_REQ_DELAY = 0.6
 
 
 def fetch_ohlcv_realdata(symbol_binance: str, interval: str, limit: int = 200) -> pd.DataFrame | None:
@@ -1130,11 +1130,11 @@ def fetch_ohlcv_realdata(symbol_binance: str, interval: str, limit: int = 200) -
     tf = _INTERVAL_MAP.get(interval, interval)
     url = f"{get_base_url()}/fapi/v1/klines"
     params = {"symbol": symbol_binance, "interval": tf, "limit": min(limit, 1500)}
-    wait_times = [5, 15, 30, 60]
+    wait_times = [15, 30, 60, 120]  # diperbesar: 418 butuh jeda lebih lama
     retries = 3
     for attempt in range(retries + 1):
         try:
-            with _BINANCE_SEMAPHORE:   # max 2 request paralel ke Binance
+            with _BINANCE_SEMAPHORE:   # max 1 request paralel ke Binance
                 r = requests.get(url, params=params, headers=get_headers(), timeout=15)
                 time.sleep(_BINANCE_REQ_DELAY)  # jeda kecil antar request, hindari burst
 
@@ -1428,11 +1428,11 @@ def _api_request(method: str, path: str, params: dict, retries: int = 4) -> dict
     Wrapper request dengan auto-retry untuk rate limit Binance:
     - 418 = IP banned sementara (terlalu banyak request) → tunggu lama
     - 429 = rate limit → tunggu sesuai Retry-After header
-    Exponential backoff: 5s, 15s, 30s, 60s
+    Exponential backoff: 15s, 30s, 60s, 120s
     """
     url     = get_base_url() + path
     headers = get_headers()
-    wait_times = [5, 15, 30, 60]
+    wait_times = [15, 30, 60, 120]  # diperbesar: 418 butuh jeda lebih lama
 
     for attempt in range(retries + 1):
         try:
@@ -10659,6 +10659,12 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     entry_tf = mode["entry_tf"]
     tier     = mode.get("tier", "FULL")
 
+    # ── Safety guard: GOLD_SCALP hanya boleh dijalankan untuk XAUUSDT ──────────
+    # Jika karena alasan apapun mode ini terpanggil untuk pair lain → langsung skip.
+    if label == "GOLD_SCALP" and pair not in ("XAUUSDT", "XAU/USDT"):
+        print(f"  ⚠️  [GOLD_SCALP] {pair} — mode ini hanya untuk XAUUSDT, skip")
+        return
+
     # ─────────────────────────────────────────────────────────────────────────
     # STEP 1 — HTF BIAS
     # ─────────────────────────────────────────────────────────────────────────
@@ -10946,6 +10952,9 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # Penalty maksimal -10 (divergence berlawanan arah trade)
     _btc_mtf_bonus = 0
     _btc_mtf_notes = []
+
+    # True jika pair ini adalah BTC sendiri → skip bonus BTC MTF (tidak relevan)
+    _is_btc_pair = pair in ("BTCUSDT", "BTC/USDT")
 
     if not _is_btc_pair:
         # Divergence H1 BTC searah trade = timing entry sempurna
@@ -11925,13 +11934,14 @@ def main():
                 # ── Routing mode: XAUUSDT hanya pakai GOLD_SCALP ─────────────────
                 # Pair lain tidak pernah dijalankan dengan GOLD_SCALP.
                 # GOLD_SCALP membutuhkan TF: 30m (HTF) + 5m (entry).
-                _is_gold = (pair == "XAUUSDT")
+                _is_gold = pair in ("XAUUSDT", "XAU/USDT")
                 if _is_gold:
                     _pair_modes = [m for m in _ALL_MODES if m["label"] in GOLD_MODES]
                     _pair_tfs   = list(set(["30m", "5m"]))
                     print(f"  🥇 [{pair}] Gold mode aktif — HTF 30m → entry 5m")
                 else:
-                    _pair_modes = _active_modes
+                    # Eksplisit exclude GOLD_SCALP dari pair non-gold
+                    _pair_modes = [m for m in _active_modes if m["label"] not in GOLD_MODES]
                     # Pastikan 4H selalu di-fetch untuk Pre-Zone Sniper,
                     # meski mode aktif hanya scalping (15m/30m).
                     _pair_tfs = list(set(htf_tfs_active + ref_tfs_needed + ["4h"]))
