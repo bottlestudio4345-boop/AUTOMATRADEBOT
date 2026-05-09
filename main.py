@@ -10,6 +10,12 @@
 ║     • Dihitung SETELAH scan selesai (bukan per-pair isolated)           ║
 ║     • Avg RSI > 70 → blok semua LONG | < 30 → blok semua SHORT         ║
 ║     • Print di setiap scan: "📊 Average Market RSI: xx.xx"             ║
+║  ✅ XAUUSDT (GOLD) — Trading Emas Independen:                           ║
+║     • Tidak terpaut BTC (exempt dari BTC filter, corr filter,          ║
+║       situational block, dan BTC ranging gate)                          ║
+║     • Analisa berdasarkan struktur sendiri (PA+S&D+S/R)                ║
+║     • Leverage 100x (via PER_SYMBOL_LEVERAGE) — berbeda dari pair lain ║
+║     • Tetap bisa trade saat BTC ranging (hanya Gold yang di-scan)      ║
 ║                                                                          ║
 ║  SIGNAL METHOD:                                                          ║
 ║  ✅ HTF Trend Bias (4H/1D) — via swing high/low structure               ║
@@ -487,8 +493,11 @@ LEVERAGE_TIERS = [
     (0,       0.001,        5),    # micro price (PEPE) → 5x
 ]
 
-def get_leverage_for_price(price: float) -> int:
-    """Pilih leverage berdasarkan harga entry."""
+def get_leverage_for_price(price: float, symbol: str = "") -> int:
+    """Pilih leverage berdasarkan harga entry, atau per-symbol override jika ada."""
+    # ── Per-symbol override (prioritas tertinggi) ─────────────────────────────
+    if symbol and symbol in PER_SYMBOL_LEVERAGE:
+        return PER_SYMBOL_LEVERAGE[symbol]
     for min_p, max_p, lev in LEVERAGE_TIERS:
         if min_p <= price < max_p:
             return lev
@@ -533,6 +542,24 @@ _daily_limit_state: dict = {
 # Set ke 0 untuk kembali ke leverage auto-tier (/resetmm)
 FIXED_LEVERAGE: int      = 0     # 0 = off (pakai leverage tier otomatis)
 
+# ── Per-Symbol Leverage Override ─────────────────────────────────────────────
+# Leverage khusus per symbol — override FIXED_LEVERAGE dan auto-tier.
+# Contoh: XAUUSDT pakai 100x sementara pair lain pakai 10x atau auto-tier.
+# Kosongkan dict ini untuk tidak ada override per-symbol.
+PER_SYMBOL_LEVERAGE: dict = {
+    "XAUUSDT": 100,   # Gold — leverage 100x (independen dari global setting)
+}
+
+# ── BTC Filter Exemption (Pair Bebas dari BTC Correlation Gate) ───────────────
+# Pair dalam set ini TIDAK kena BTC Multi-TF Direction Gate maupun BTC Corr Filter.
+# Analisa mereka sepenuhnya independen dari arah BTC.
+# Default: BTCUSDT (BTC tidak filter dirinya sendiri).
+# Tambahan: XAUUSDT (Gold tidak berkorelasi dengan BTC — punya driver sendiri).
+BTC_EXEMPT_PAIRS: set = {
+    "BTCUSDT", "BTC/USDT",   # BTC tidak filter dirinya sendiri
+    "XAUUSDT", "XAU/USDT",   # Gold — independen dari BTC, driver: DXY, suku bunga, geopolitik
+}
+
 # ── Hedge Mode detection ─────────────────────────────────────────────────────
 _hedge_mode: bool | None = None   # None = belum dideteksi
 
@@ -553,12 +580,22 @@ def is_hedge_mode() -> bool:
 # ── Scan Modes ──────────────────────────────────────────────────────────────
 _ALL_MODES = [
     # SWING dihapus — terlalu lambat, stuck di 4h
-    {"label": "INTRADAY", "htf_tf": "1d",  "entry_tf": "1h",  "ref_tf": "4h",  "tier": "FULL"},
-    {"label": "SCALPING", "htf_tf": "4h",  "entry_tf": "1h",  "ref_tf": None,  "tier": "FULL"},
-    {"label": "LOW_TF",   "htf_tf": "1h",  "entry_tf": "15m", "ref_tf": None,  "tier": "RELAXED"},
+    {"label": "INTRADAY",   "htf_tf": "1d",  "entry_tf": "1h",  "ref_tf": "4h",  "tier": "FULL"},
+    {"label": "SCALPING",   "htf_tf": "4h",  "entry_tf": "1h",  "ref_tf": None,  "tier": "FULL"},
+    {"label": "LOW_TF",     "htf_tf": "1h",  "entry_tf": "15m", "ref_tf": None,  "tier": "RELAXED"},
     # ── LTF 30M: sinyal Lower Time Frame via HTF 1h → entry 30m ──────────────
-    {"label": "LTF_30M",  "htf_tf": "1h",  "entry_tf": "30m", "ref_tf": None,  "tier": "RELAXED"},
+    {"label": "LTF_30M",   "htf_tf": "1h",  "entry_tf": "30m", "ref_tf": None,  "tier": "RELAXED"},
+    # ── GOLD_SCALP: khusus XAUUSDT — HTF 30m → entry 5m ─────────────────────
+    # Gold bergerak cepat dan respek level micro — 5m ideal untuk entry presisi.
+    # Mode ini hanya aktif saat pair == XAUUSDT (difilter di process_pair).
+    {"label": "GOLD_SCALP", "htf_tf": "30m", "entry_tf": "5m", "ref_tf": None,  "tier": "RELAXED"},
 ]
+
+# ── Mode yang dipakai khusus XAUUSDT (menggantikan mode umum) ────────────────
+# XAUUSDT tidak dijalankan dengan INTRADAY/SCALPING/LOW_TF/LTF_30M.
+# Hanya GOLD_SCALP yang dipakai: HTF 30m memberikan bias arah,
+# entry 5m memberikan presisi timing di level S&D/OB/FVG.
+GOLD_MODES = ["GOLD_SCALP"]
 
 # ── Active Modes — diubah via /scalpingonly / /intradayonly ──────────────────
 # "ALL"      = semua mode aktif (default)
@@ -647,10 +684,66 @@ SL_TP_CAPS: dict = {
     # LOW_TF/LTF_30M: SL diperketat ke 1.2% — scalping 15m/30m butuh SL sempit.
     # SL 3% di leverage 15x = -45% modal per trade → terlalu besar untuk scalper.
     # TP 2.4% (1.2% SL × RR 2.0) masih realistis dalam 2-4 candle 15m.
-    "LOW_TF"  : (0.012, 0.030),   # entry 15m → SL max 1.2%, TP max 3.0%
-    "LTF_30M" : (0.015, 0.035),   # entry 30m → SL max 1.5%, TP max 3.5%
-    "SCALPING": (0.040, 0.080),   # entry 1h  → SL max 4%, TP max 8%
-    "INTRADAY": (0.050, 0.120),   # entry 1h  → SL max 5%, TP max 12%
+    "LOW_TF"    : (0.012, 0.030),   # entry 15m → SL max 1.2%, TP max 3.0%
+    "LTF_30M"   : (0.015, 0.035),   # entry 30m → SL max 1.5%, TP max 3.5%
+    "SCALPING"  : (0.040, 0.080),   # entry 1h  → SL max 4%, TP max 8%
+    "INTRADAY"  : (0.050, 0.120),   # entry 1h  → SL max 5%, TP max 12%
+    # GOLD_SCALP: entry 5m — Gold volatil (ATR 5m bisa $5-15), SL lebih longgar dari altcoin.
+    # SL 0.5% di harga $3300 = $16.5 — cukup beri napas noise 5m Gold.
+    # TP 1.5% = $49.5 — realistis dalam 3-8 candle 5m di sesi London/NY.
+    "GOLD_SCALP": (0.005, 0.015),   # entry 5m  → SL max 0.5%, TP max 1.5%
+}
+
+# ── Scoring khusus XAUUSDT (Gold) ────────────────────────────────────────────
+# Logika pasar Gold berbeda dari altcoin:
+#   • Respons kuat terhadap S/R psikologis (level round number $3000, $3100, dll)
+#   • Liquidity sweep sangat reliable — institusi sering sweep lows/highs sebelum balik
+#   • BOS di 5m penting: konfirmasi struktur micro sebelum entry
+#   • Volume Gold futures tidak se-ekstrem crypto — threshold lebih rendah
+#   • Session sangat kritis: London-NY overlap adalah waktu emas Gold bergerak
+#
+# Bobot lebih tinggi dari default untuk:
+#   • Liquidity sweep (Gold sering false-break → sweep sangat meaningful)
+#   • BOS konfirmasi (struktur 5m harus clear)
+#   • Session (penalty besar kalau trading di luar London/NY)
+#
+# Bobot lebih rendah dari default untuk:
+#   • Momentum consecutive candle (Gold sering choppy di 5m, susah N candle sama arah)
+#   • Macro (BTC macro tidak relevan untuk Gold)
+GOLD_SCORE_WEIGHTS: dict = {
+    # Tier 1 HTF bias (30m) — penting tapi bukan satu-satunya
+    "htf_aligned":        18,   # default: 15 → naikkan sedikit, 30m HTF harus sejalan
+    "htf_penalty":       -12,   # default: -10 → lebih ketat jika melawan 30m bias
+
+    # Tier 2 BOS — kritis untuk Gold 5m
+    "bos_strong":         28,   # default: 25 → naikkan, BOS 5m Gold lebih signifikan
+    "bos_weak":           14,   # default: 12
+    "bos_penalty":       -12,   # default: -10 → lebih keras jika tidak ada BOS
+
+    # Tier 3 Momentum — diturunkan, Gold 5m sering choppy
+    "momentum_aligned":   10,   # default: 15 → turunkan, jangan terlalu bergantung N candle
+    "momentum_none":       0,
+    "momentum_anti":      -3,   # default: -5 → lebih permisif
+
+    # Tier 4 Liquidity sweep — paling berharga untuk Gold
+    "liq_strong":         20,   # default: 15 → dinaikkan, sweep di Gold sangat reliable
+    "liq_weak":           12,   # default: 8
+    "liq_none":           -3,   # default: -5 → sedikit lebih permisif
+
+    # Tier 5 Entry zone — tetap penting
+    "zone_double":        18,   # default: 15 → confluence lebih penting di 5m
+    "zone_single":        12,   # default: 10
+    "zone_none":           0,
+
+    # Supporting
+    "displacement":        8,   # default: 10 → sedikit dikurangi (Gold impulse bisa besar tapi sering noise)
+    "session_london_ny":  10,   # default: 5 → session jauh lebih kritis untuk Gold
+    "session_overlap":    15,   # bonus ekstra saat London-NY overlap (12:00-15:00 UTC)
+    "session_asia":       -8,   # Asia session: penalti, Gold sepi & choppy
+    "session_offhours":  -15,   # Off-hours: penalti besar, jangan trade Gold di luar jam utama
+
+    # Score gate minimum khusus Gold
+    "min_score":          50,   # lebih rendah dari default 55 karena mode lebih presisi
 }
 
 SCAN_INTERVAL = 30           # seconds between full scans — 15 terlalu cepat, bisa kena 418
@@ -672,6 +765,8 @@ PAIR_LIST = [
     # ── Tier 4: DeFi & Ecosystem ─────────────────────────────────────────────
     "1000SHIBUSDT",  "TONUSDT",  "EGLDUSDT", "HYPEUSDT",  "RUNEUSDT",
     "LDOUSDT",   "SNXUSDT",  "CRVUSDT",   "COMPUSDT",
+    # ── Commodity (Gold) — independen dari BTC, leverage khusus ─────────────
+    "XAUUSDT",
 ]
 
 
@@ -739,16 +834,18 @@ RR_GRADE_B           = 1.5   # Grade B = threshold minimum (sama dengan RR_MIN)
 
 # RR per mode — scalping TF kecil pakai threshold lebih longgar
 RR_MIN_PER_MODE: dict = {
-    "LOW_TF"  : 1.5,   # 15m entry
-    "LTF_30M" : 1.5,   # 30m entry
-    "SCALPING": 1.5,   # 1h entry
-    "INTRADAY": 1.5,   # 1h HTF entry
+    "LOW_TF"    : 1.5,   # 15m entry
+    "LTF_30M"   : 1.5,   # 30m entry
+    "SCALPING"  : 1.5,   # 1h entry
+    "INTRADAY"  : 1.5,   # 1h HTF entry
+    "GOLD_SCALP": 1.5,   # 5m entry Gold — RR 1.5 minimum, SL sempit jadi TP realistis
 }
 RR_GRADE_A_PER_MODE: dict = {
-    "LOW_TF"  : 2.0,
-    "LTF_30M" : 2.0,
-    "SCALPING": 2.5,
-    "INTRADAY": 2.5,
+    "LOW_TF"    : 2.0,
+    "LTF_30M"   : 2.0,
+    "SCALPING"  : 2.5,
+    "INTRADAY"  : 2.5,
+    "GOLD_SCALP": 2.0,   # Grade A Gold: RR 2.0 — TP 1% dengan SL 0.5%
 }
 
 def get_rr_min_for_mode(mode_label: str) -> float:
@@ -2287,13 +2384,14 @@ def check_pre_zone_sniper(
             if (now_ts - last_ts) < PRE_ZONE_COOLDOWN_SEC:
                 continue
 
-            # ── Filter BTC bias ──────────────────────────────────────────────
-            if direction == "BULLISH" and not btc_allow_long:
-                continue
-            if direction == "BEARISH" and not btc_allow_short:
-                continue
-            if btc_bias == "RANGING":
-                continue
+            # ── Filter BTC bias (tidak berlaku untuk BTC_EXEMPT_PAIRS) ──────────
+            if pair not in BTC_EXEMPT_PAIRS:
+                if direction == "BULLISH" and not btc_allow_long:
+                    continue
+                if direction == "BEARISH" and not btc_allow_short:
+                    continue
+                if btc_bias == "RANGING":
+                    continue
 
             # ── Cari zona fresh ──────────────────────────────────────────────
             zones = find_supply_demand_zones(df_4h, direction)
@@ -4940,6 +5038,110 @@ def grade_signal(rr: float) -> Optional[str]:
     return None
 
 
+def session_score_gold(session: str) -> int:
+    """
+    Session scoring khusus Gold — jauh lebih ketat dari altcoin.
+    London-NY overlap (12:00-15:00 UTC) adalah window terbaik Gold.
+    Asia session: Gold sangat sepi, spread lebar, choppy → penalti.
+    """
+    h = datetime.now(timezone.utc).hour
+    w = GOLD_SCORE_WEIGHTS
+    # London-NY overlap: 12:00-15:00 UTC — bonus tertinggi
+    if 12 <= h < 15:
+        return w["session_overlap"]
+    if session == "London":
+        return w["session_london_ny"]
+    if session == "New York":
+        return w["session_london_ny"]
+    if session == "Asia":
+        return w["session_asia"]
+    return w["session_offhours"]
+
+
+def compute_score_gold(
+    htf_aligned:      bool,
+    bos_confirmed:    bool,
+    bos_strength:     str,
+    momentum_aligned: bool,
+    momentum_present: bool,
+    liq_swept:        bool,
+    sweep_strength:   str,
+    in_ob:            bool,
+    in_fvg:           bool,
+    in_imb:           bool  = False,
+    in_gap:           bool  = False,
+    displacement:     bool  = False,
+    vol_rat:          float = 0.0,
+    session:          str   = "Off-Hours",
+    rsi:              float = 50.0,
+    macro_pts:        int   = 0,
+    ema_pts:          int   = 0,
+    ref_aligned:      bool  = False,
+    direction:        str   = "BULLISH",
+    **kwargs,
+) -> tuple:
+    """
+    Scoring khusus XAUUSDT (GOLD_SCALP mode — HTF 30m → entry 5m).
+
+    Perbedaan dari compute_score standar:
+      • Liquidity sweep diberi bobot lebih tinggi (Gold sering false-break institusional)
+      • Session jauh lebih berpengaruh (penalti besar di Asia/off-hours)
+      • Momentum consecutive candle dikurangi bobotnya (Gold 5m sering choppy)
+      • BOS 5m diberi bobot lebih (struktur micro harus jelas sebelum entry)
+      • Macro BTC diabaikan (Gold tidak berkorelasi BTC)
+    """
+    w  = GOLD_SCORE_WEIGHTS
+    bd = {}
+
+    # Tier 1: HTF 30m bias
+    bd["htf"] = w["htf_aligned"] if htf_aligned else w["htf_penalty"]
+
+    # Tier 2: BOS 5m
+    if bos_confirmed:
+        bd["bos"] = w["bos_strong"] if bos_strength == "STRONG" else w["bos_weak"]
+    else:
+        bd["bos"] = w["bos_penalty"]
+
+    # Tier 3: Momentum — bobot lebih rendah untuk Gold 5m
+    if momentum_aligned:
+        bd["momentum"] = w["momentum_aligned"]
+    elif momentum_present:
+        bd["momentum"] = w["momentum_none"]
+    else:
+        bd["momentum"] = w["momentum_anti"]
+
+    # Tier 4: Liquidity sweep — bobot tertinggi untuk Gold
+    if liq_swept and sweep_strength == "STRONG":
+        bd["liquidity"] = w["liq_strong"]
+    elif liq_swept:
+        bd["liquidity"] = w["liq_weak"]
+    else:
+        bd["liquidity"] = w["liq_none"]
+
+    # Tier 5: Entry zone OB/FVG/IMB/Gap
+    _zone_count = sum([in_ob, in_fvg, in_imb, in_gap])
+    if _zone_count >= 2:
+        bd["entry_zone"] = w["zone_double"]
+    elif _zone_count == 1:
+        bd["entry_zone"] = w["zone_single"]
+    else:
+        bd["entry_zone"] = w["zone_none"]
+
+    # Supporting
+    bd["displacement"] = w["displacement"] if displacement else 0
+    bd["volume"]       = 4 if vol_rat >= 1.3 else (2 if vol_rat >= 1.1 else 0)  # threshold lebih rendah untuk Gold
+    bd["session"]      = session_score_gold(session)
+    bd["rsi"]          = rsi_score(rsi, direction)
+    bd["ema"]          = ema_pts
+    bd["ref_tf"]       = 0   # tidak ada ref_tf di GOLD_SCALP
+    # macro dari BTC diabaikan untuk Gold (sudah exempt dari BTC filter)
+    # tapi tetap dimasukkan untuk skor lain (misal dari OB zone confluence)
+    bd["macro"]        = max(0, macro_pts)  # hanya ambil bonus, abaikan penalti BTC macro
+
+    total = sum(bd.values())
+    return total, bd
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ██  SECTION 15 — VOLATILITY & CONFIRMATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6040,9 +6242,14 @@ def execute_trade(signal: dict, mode: dict):
     _sl_dist_pct = _sl_dist_abs / max(_entry, 1e-9)
 
     if FIXED_LEVERAGE > 0:
-        trade_leverage = FIXED_LEVERAGE
+        # Cek apakah symbol punya per-symbol override (prioritas lebih tinggi dari FIXED_LEVERAGE)
+        if symbol in PER_SYMBOL_LEVERAGE:
+            trade_leverage = PER_SYMBOL_LEVERAGE[symbol]
+            print(f"  ⚡ [{symbol}] Per-symbol leverage override: {trade_leverage}x (abaikan FIXED_LEVERAGE={FIXED_LEVERAGE}x)")
+        else:
+            trade_leverage = FIXED_LEVERAGE
     else:
-        trade_leverage = get_leverage_for_price(_entry)
+        trade_leverage = get_leverage_for_price(_entry, symbol=symbol)
 
     # ── Hitung lot dari max SL loss ───────────────────────────────────────────
     max_loss_usdt = balance * MAX_SL_LOSS_PCT            # kerugian maks jika SL kena
@@ -10393,17 +10600,30 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             f"({trade_direction}) | LTF score {ranging_ctx.ltf_score}"
         )
 
-    # RELAXED tier (LOW_TF): pakai logika asli, skip ranging tanpa CHoCH
+    # RELAXED tier (LOW_TF / LTF_30M): pakai logika asli, skip ranging tanpa CHoCH
+    # GOLD_SCALP: HTF adalah 30m (bukan 1h), logika ranging lebih permisif —
+    # Gold di 30m sering "ranging" tapi punya directional bias micro di 5m.
+    # Jika 30m ranging → ambil arah dari candle terakhir 30m (tidak hard-skip).
     if tier == "RELAXED":
-        if htf_bias == "RANGING" and htf_event != "CHoCH":
-            print(f"  ⏭  [{label}] {pair} — 1H ranging tanpa CHoCH, skip")
-            return
-        if htf_bias == "RANGING":
-            last            = df_htf.iloc[-1]
-            trade_direction = "BULLISH" if float(last["close"]) > float(last["open"]) else "BEARISH"
-            htf_aligned     = False
+        if label == "GOLD_SCALP":
+            # Gold: 30m ranging → tetap lanjut, ambil arah dari candle terakhir
+            if htf_bias == "RANGING":
+                last            = df_htf.iloc[-1]
+                trade_direction = "BULLISH" if float(last["close"]) > float(last["open"]) else "BEARISH"
+                htf_aligned     = False
+                print(f"  🥇 [{label}] {pair} — 30m ranging, arah dari candle terakhir: {trade_direction}")
+            else:
+                htf_aligned = True
         else:
-            htf_aligned = True
+            if htf_bias == "RANGING" and htf_event != "CHoCH":
+                print(f"  ⏭  [{label}] {pair} — 1H ranging tanpa CHoCH, skip")
+                return
+            if htf_bias == "RANGING":
+                last            = df_htf.iloc[-1]
+                trade_direction = "BULLISH" if float(last["close"]) > float(last["open"]) else "BEARISH"
+                htf_aligned     = False
+            else:
+                htf_aligned = True
 
     ranging_ctx = locals().get("ranging_ctx")  # None kalau HTF tidak ranging
 
@@ -10428,9 +10648,11 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # Gate utama berbasis BTC Daily → H4 → H1 analysis.
     # LONG diblok jika BTC Daily bukan BULLISH.
     # SHORT diblok jika BTC Daily bukan BEARISH.
-    # Exception: BTCUSDT sendiri lolos (BTC tidak filter dirinya sendiri).
-    _is_btc_pair = pair in ("BTCUSDT", "BTC/USDT")
-    if not _is_btc_pair:
+    # Exception: pair dalam BTC_EXEMPT_PAIRS lolos sepenuhnya (analisa independen).
+    #   • BTCUSDT : BTC tidak filter dirinya sendiri
+    #   • XAUUSDT : Gold punya driver sendiri (DXY, suku bunga, geopolitik) — tidak berkorelasi BTC
+    _is_btc_exempt = pair in BTC_EXEMPT_PAIRS
+    if not _is_btc_exempt:
         if trade_direction == "BULLISH" and not btc_allow_long:
             _dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  🚫 [{label}] {pair} {_dir} — BTC Daily tidak BULLISH, diblok BTC Multi-TF Gate")
@@ -10439,6 +10661,8 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             _dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  🚫 [{label}] {pair} {_dir} — BTC Daily tidak BEARISH, diblok BTC Multi-TF Gate")
             return
+    elif pair in ("XAUUSDT", "XAU/USDT"):
+        print(f"  🥇 [{label}] {pair} — GOLD exempt dari BTC filter (analisa independen)")
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── MARKET REGIME HARDBLOCK — BTC EMA + BTCD EMA ─────────────────────────
@@ -10642,6 +10866,10 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     if not BTC_CORR_FILTER_ON:
         corr_blocked = False
 
+    # Pair dalam BTC_EXEMPT_PAIRS juga bebas dari corr filter (Gold, BTC sendiri)
+    if pair in BTC_EXEMPT_PAIRS:
+        corr_blocked = False
+
     if corr_blocked:
         dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  🚫 [{label}] {pair} {dir_str} — BTCD CORR BLOK: {corr_reason}")
@@ -10672,17 +10900,20 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     _sit = btc_situation["situation"]
     _sit_reason = btc_situation["reason"]
 
-    if btc_situation["block_short"] and trade_direction == "BEARISH":
+    # Pair dalam BTC_EXEMPT_PAIRS (Gold, dll) tidak kena BTC Situational Block
+    _btc_sit_exempt = pair in BTC_EXEMPT_PAIRS
+
+    if not _btc_sit_exempt and btc_situation["block_short"] and trade_direction == "BEARISH":
         print(f"  🚫 [{label}] {pair} SHORT — BTC SITUATIONAL BLOCK: {_sit_reason}")
         return
 
-    if btc_situation["block_long"] and trade_direction == "BULLISH":
+    if not _btc_sit_exempt and btc_situation["block_long"] and trade_direction == "BULLISH":
         print(f"  🚫 [{label}] {pair} LONG — BTC SITUATIONAL BLOCK: {_sit_reason}")
         return
 
-    if btc_situation["warn_short"] and trade_direction == "BEARISH":
+    if not _btc_sit_exempt and btc_situation["warn_short"] and trade_direction == "BEARISH":
         print(f"  ⚠️  [{label}] {pair} SHORT — BTC SITUATIONAL WARN: {_sit_reason}")
-    if btc_situation["warn_long"] and trade_direction == "BULLISH":
+    if not _btc_sit_exempt and btc_situation["warn_long"] and trade_direction == "BULLISH":
         print(f"  ⚠️  [{label}] {pair} LONG — BTC SITUATIONAL WARN: {_sit_reason}")
 
     _sit_adj = btc_situation["score_adj"]
@@ -10692,29 +10923,55 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         print(f"  🪙 [{label}] {pair} — BTC Situation: {_sit} ({_sit_adj:+d} pts)")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # STEP 5 — SCORING AKUMULATIF (SMC Flow — IMB+Gap aware, sesuai main(1).py)
+    # STEP 5 — SCORING AKUMULATIF
+    # Gold (GOLD_SCALP): pakai compute_score_gold dengan bobot khusus Gold.
+    # Pair lain: pakai compute_score standar.
     # ─────────────────────────────────────────────────────────────────────────
-    score, score_bd = compute_score(
-        htf_aligned      = htf_aligned,
-        bos_confirmed    = bos_confirmed,
-        bos_strength     = bos_str_label,
-        momentum_aligned = momentum_align,
-        momentum_present = momentum_any,
-        liq_swept        = liq_swept,
-        sweep_strength   = sweep_strength,
-        in_ob            = in_ob,
-        in_fvg           = in_fvg,
-        in_imb           = in_imb,
-        in_gap           = in_gap,
-        displacement     = displacement,
-        vol_rat          = vol_rat,
-        session          = session,
-        rsi              = rsi,
-        macro_pts        = m_pts,
-        ema_pts          = ema_pts,
-        ref_aligned      = ref_aligned,
-        direction        = trade_direction,
-    )
+    _is_gold_mode = (label == "GOLD_SCALP")
+
+    if _is_gold_mode:
+        score, score_bd = compute_score_gold(
+            htf_aligned      = htf_aligned,
+            bos_confirmed    = bos_confirmed,
+            bos_strength     = bos_str_label,
+            momentum_aligned = momentum_align,
+            momentum_present = momentum_any,
+            liq_swept        = liq_swept,
+            sweep_strength   = sweep_strength,
+            in_ob            = in_ob,
+            in_fvg           = in_fvg,
+            in_imb           = in_imb,
+            in_gap           = in_gap,
+            displacement     = displacement,
+            vol_rat          = vol_rat,
+            session          = session,
+            rsi              = rsi,
+            macro_pts        = m_pts,
+            ema_pts          = ema_pts,
+            direction        = trade_direction,
+        )
+    else:
+        score, score_bd = compute_score(
+            htf_aligned      = htf_aligned,
+            bos_confirmed    = bos_confirmed,
+            bos_strength     = bos_str_label,
+            momentum_aligned = momentum_align,
+            momentum_present = momentum_any,
+            liq_swept        = liq_swept,
+            sweep_strength   = sweep_strength,
+            in_ob            = in_ob,
+            in_fvg           = in_fvg,
+            in_imb           = in_imb,
+            in_gap           = in_gap,
+            displacement     = displacement,
+            vol_rat          = vol_rat,
+            session          = session,
+            rsi              = rsi,
+            macro_pts        = m_pts,
+            ema_pts          = ema_pts,
+            ref_aligned      = ref_aligned,
+            direction        = trade_direction,
+        )
 
     # Terapkan penalty candle konfirmasi ke score total
     if _conf_candle_penalty < 0:
@@ -10726,9 +10983,11 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         return
 
     # Threshold berdasarkan tier
-    # PENTING: MIN_SCORE_CUSTOM berlaku untuk SEMUA tier (FULL & RELAXED).
+    # Gold GOLD_SCALP: pakai min_score dari GOLD_SCORE_WEIGHTS (lebih rendah sedikit).
     # RELAXED tier TIDAK mendapat diskon — kalau custom aktif, gate-nya sama.
-    if tier == "RELAXED":
+    if _is_gold_mode:
+        effective_gate = GOLD_SCORE_WEIGHTS["min_score"]
+    elif tier == "RELAXED":
         effective_gate = MIN_SCORE_RELAXED_CUSTOM if MIN_SCORE_CUSTOM > 0 else MIN_SCORE_RELAXED
     else:
         effective_gate = MIN_SCORE_CUSTOM if MIN_SCORE_CUSTOM > 0 else MIN_SCORE
@@ -11363,14 +11622,22 @@ def main():
             print(f"   Alasan: {btc_mtf.reason}")
 
             # ── GATE UTAMA: Jika BTC tidak punya setup → skip scan pair ─────────
+            # Pengecualian: BTC_EXEMPT_PAIRS (XAUUSDT/Gold, BTCUSDT) tetap di-scan
+            # karena tidak berkorelasi dengan BTC — punya driver market sendiri.
             if not btc_mtf.setup_valid:
                 print(f"\n🛑 BTC RANGING di Daily — tidak ada setup jelas.")
-                print(f"   Semua scan altcoin DITUNDA sampai BTC punya arah trending.")
+                # Cek apakah ada exempt pair yang perlu tetap di-scan
+                _exempt_active = [p for p in get_active_pairs() if p in BTC_EXEMPT_PAIRS]
+                if _exempt_active:
+                    print(f"   🥇 Exempt pairs tetap di-scan meski BTC ranging: {_exempt_active}")
+                else:
+                    print(f"   Semua scan altcoin DITUNDA sampai BTC punya arah trending.")
                 # Kirim notif Telegram setiap N menit sekali (tidak setiap scan)
                 _btc_ranging_notif_key = "btc_ranging_last_notif"
                 _last_notif_ts = getattr(analyze_btc_multitf, "_ranging_notif_ts", 0)
                 if time.time() - _last_notif_ts > 1800:   # 30 menit sekali
                     analyze_btc_multitf._ranging_notif_ts = time.time()
+                    _exempt_note = f"\n🥇 Tetap scan: {', '.join(_exempt_active)}" if _exempt_active else ""
                     send_telegram_raw(
                         f"⏸ <b>BTC Ranging — Scan Ditunda</b>\n"
                         f"{'─'*38}\n"
@@ -11380,9 +11647,16 @@ def main():
                         f"{'─'*38}\n"
                         f"⚠️ Strategi: Tidak ambil posisi saat BTC ranging.\n"
                         f"Bot akan otomatis resume saat BTC punya arah trending kembali."
+                        + _exempt_note
                     )
-                time.sleep(SCAN_INTERVAL)
-                continue
+                # Jika hanya ada exempt pairs yang scan, lanjut dengan list terbatas
+                if not _exempt_active:
+                    time.sleep(SCAN_INTERVAL)
+                    continue
+                # Override: hanya scan exempt pairs saat BTC ranging
+                _btc_ranging_override = True
+            else:
+                _btc_ranging_override = False
 
             # ── BTC.D: fetch untuk filter korelasi ───────────────────────────────
             if BTC_CORR_FILTER_ON:
@@ -11427,46 +11701,53 @@ def main():
 
             def process_pair(pair):
                 tf_cache = {}
-                # Pastikan 4H selalu di-fetch untuk Pre-Zone Sniper,
-                # meski mode aktif hanya scalping (15m/30m).
-                all_tfs = list(set(htf_tfs_active + ref_tfs_needed + ["4h"]))
-                if "4h" not in _TF_LIMIT_MAP:
-                    _TF_LIMIT_MAP["4h"] = 120
-                for tf in all_tfs:
+
+                # ── Routing mode: XAUUSDT hanya pakai GOLD_SCALP ─────────────────
+                # Pair lain tidak pernah dijalankan dengan GOLD_SCALP.
+                # GOLD_SCALP membutuhkan TF: 30m (HTF) + 5m (entry).
+                _is_gold = (pair == "XAUUSDT")
+                if _is_gold:
+                    _pair_modes = [m for m in _ALL_MODES if m["label"] in GOLD_MODES]
+                    _pair_tfs   = list(set(["30m", "5m"]))
+                    print(f"  🥇 [{pair}] Gold mode aktif — HTF 30m → entry 5m")
+                else:
+                    _pair_modes = _active_modes
+                    # Pastikan 4H selalu di-fetch untuk Pre-Zone Sniper,
+                    # meski mode aktif hanya scalping (15m/30m).
+                    _pair_tfs = list(set(htf_tfs_active + ref_tfs_needed + ["4h"]))
+                    if "4h" not in _TF_LIMIT_MAP:
+                        _TF_LIMIT_MAP["4h"] = 120
+
+                for tf in _pair_tfs:
                     try:
                         limit = _TF_LIMIT_MAP.get(tf, 150)
                         tf_cache[tf] = fetch_ohlcv_realdata(pair, tf, limit=limit)
-                        time.sleep(0.4)   # 0.15 → 0.4: kurangi risiko 418 saat banyak pair paralel
+                        time.sleep(0.4)
                     except Exception as e:
                         print(f"  ⚠️  {pair} @ {tf}: {e}")
                         tf_cache[tf] = None
 
-                # ── PRE-ZONE SNIPER: evaluasi setup & pasang limit di zona 4H ──
-                # Dipanggil SEBELUM analyze_pair biasa.
-                # Menggunakan data 4H yang sudah di-cache untuk efisiensi.
-                # Jika setup oke (score + RR terpenuhi) → langsung execute_trade
-                # dengan entry = zone_top/bottom sehingga terisi saat harga menyentuh zona.
-                try:
-                    check_pre_zone_sniper(
-                        pair            = pair,
-                        df_4h           = tf_cache.get("4h"),
-                        btc_bias        = btc_bias,
-                        btc_allow_long  = btc_mtf.allow_long,
-                        btc_allow_short = btc_mtf.allow_short,
-                        session         = session,
-                    )
-                except Exception as _pzs_err:
-                    print(f"  ⚠️  pre_zone_sniper [{pair}]: {_pzs_err}")
+                # ── PRE-ZONE SNIPER: hanya untuk non-Gold (pakai 4H) ─────────────
+                if not _is_gold:
+                    try:
+                        check_pre_zone_sniper(
+                            pair            = pair,
+                            df_4h           = tf_cache.get("4h"),
+                            btc_bias        = btc_bias,
+                            btc_allow_long  = btc_mtf.allow_long,
+                            btc_allow_short = btc_mtf.allow_short,
+                            session         = session,
+                        )
+                    except Exception as _pzs_err:
+                        print(f"  ⚠️  pre_zone_sniper [{pair}]: {_pzs_err}")
 
                 local_candidates = []
-                for mode in _active_modes:
+                for mode in _pair_modes:
                     df_htf = tf_cache.get(mode["htf_tf"])
                     df_ref = tf_cache.get(mode["ref_tf"]) if mode.get("ref_tf") else None
                     if df_htf is None:
                         continue
                     try:
-                        # ── Filter arah berdasarkan BTC multi-TF result ──────────
-                        # Setiap pair dicek apakah arahnya diizinkan oleh BTC setup
                         analyze_pair(
                             pair             = pair,
                             mode             = mode,
@@ -11489,6 +11770,10 @@ def main():
                         signal_candidates.extend(local_candidates)
 
             active_pairs = get_active_pairs()   # ← super scalper: 25 pair; normal: full list
+            # Saat BTC ranging: hanya scan exempt pairs (Gold, dll) yang tidak bergantung BTC
+            if _btc_ranging_override:
+                active_pairs = [p for p in active_pairs if p in BTC_EXEMPT_PAIRS]
+                print(f"  🥇 BTC RANGING override: scan terbatas ke {active_pairs}")
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {executor.submit(process_pair, pair): pair for pair in active_pairs}
                 for future in as_completed(futures):
