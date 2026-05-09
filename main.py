@@ -1117,8 +1117,10 @@ _INTERVAL_MAP = {
 
 # OPT: Global rate limiter — batasi max request Binance yang berjalan BERSAMAAN
 # Tanpa ini, 3 thread × 5 TF bisa kirim 15 request hampir serentak → 418
-# Semaphore(4): max 4 request berjalan paralel di seluruh thread
-_BINANCE_SEMAPHORE = threading.Semaphore(4)
+# Semaphore(2): max 2 request berjalan paralel — lebih konservatif, hindari 418
+_BINANCE_SEMAPHORE = threading.Semaphore(2)
+# Jeda minimum antar request (detik) — jaga jarak biar tidak dianggap burst
+_BINANCE_REQ_DELAY = 0.3
 
 
 def fetch_ohlcv_realdata(symbol_binance: str, interval: str, limit: int = 200) -> pd.DataFrame | None:
@@ -1132,8 +1134,9 @@ def fetch_ohlcv_realdata(symbol_binance: str, interval: str, limit: int = 200) -
     retries = 3
     for attempt in range(retries + 1):
         try:
-            with _BINANCE_SEMAPHORE:   # OPT: max 4 request paralel ke Binance
+            with _BINANCE_SEMAPHORE:   # max 2 request paralel ke Binance
                 r = requests.get(url, params=params, headers=get_headers(), timeout=15)
+                time.sleep(_BINANCE_REQ_DELAY)  # jeda kecil antar request, hindari burst
 
             if r.status_code == 418:
                 wait = wait_times[min(attempt, len(wait_times) - 1)]
@@ -1229,12 +1232,13 @@ _tg_offset = 0
 def send_telegram_raw(msg):
     """
     Kirim pesan ke Telegram dengan error handling lengkap:
-    - Cek HTTP response (tidak cuma network exception)
+    - Auto-split jika pesan > 4096 karakter (batas Telegram)
     - Retry otomatis jika rate-limited (429)
-    - Fallback ke plain text jika HTML parse_mode gagal (misal karakter < > & di pesan)
+    - Fallback ke plain text jika HTML parse_mode gagal
     - Log detail error ke console agar tidak hilang diam-diam
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    MAX_LEN = 4000  # sedikit di bawah 4096 untuk safety margin
 
     def _send(text, parse_mode="HTML"):
         try:
@@ -1248,46 +1252,59 @@ def send_telegram_raw(msg):
             print(f"⚠️ Telegram network error: {e}")
             return None
 
-    # ── Attempt 1: kirim dengan HTML parse_mode ──────────────────────────────
-    r = _send(msg, parse_mode="HTML")
-
-    if r is None:
-        return   # network error, sudah di-log
-
-    # ── Sukses → selesai, tidak perlu lanjut ─────────────────────────────────
-    if r.ok:
-        return
-
-    # ── Rate limit: tunggu dan retry sekali ──────────────────────────────────
-    if r.status_code == 429:
-        try:
-            retry_after = r.json().get("parameters", {}).get("retry_after", 5)
-        except Exception:
-            retry_after = 5
-        print(f"⚠️ Telegram rate limit — tunggu {retry_after}s lalu retry")
-        time.sleep(retry_after)
-        r = _send(msg, parse_mode="HTML")
-        if r is None or r.ok:
-            return   # berhasil atau network error — selesai
-
-    # ── HTML parse error: fallback ke plain text ─────────────────────────────
-    if not r.ok:
-        try:
-            err_body = r.json()
-            err_desc = err_body.get("description", "")
-        except Exception:
-            err_desc = r.text[:200]
-
-        if "can't parse entities" in err_desc.lower() or r.status_code == 400:
-            # Coba kirim ulang tanpa parse_mode (plain text)
+    def _send_with_fallback(text):
+        """Kirim satu chunk — coba HTML dulu, fallback plain text kalau gagal."""
+        r = _send(text, parse_mode="HTML")
+        if r is None:
+            return
+        if r.ok:
+            return
+        # Rate limit
+        if r.status_code == 429:
+            try:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 5)
+            except Exception:
+                retry_after = 5
+            print(f"⚠️ Telegram rate limit — tunggu {retry_after}s lalu retry")
+            time.sleep(retry_after)
+            r = _send(text, parse_mode="HTML")
+            if r is None or r.ok:
+                return
+        # HTML parse error atau message too long → fallback plain text
+        if not r.ok:
+            try:
+                err_desc = r.json().get("description", "")
+            except Exception:
+                err_desc = r.text[:200]
             print(f"⚠️ Telegram HTML parse error — fallback ke plain text. Desc: {err_desc}")
             import re
-            plain_msg = re.sub(r"<[^>]+>", "", msg)   # strip semua HTML tag
-            r2 = _send(plain_msg, parse_mode="")
+            plain = re.sub(r"<[^>]+>", "", text)
+            r2 = _send(plain, parse_mode="")
             if r2 is None or not r2.ok:
                 print(f"⚠️ Telegram plain text fallback juga gagal: {r2.status_code if r2 else 'N/A'}")
-        else:
-            print(f"⚠️ Telegram error HTTP {r.status_code}: {err_desc}")
+
+    # ── Auto-split jika pesan terlalu panjang ─────────────────────────────────
+    if len(msg) <= MAX_LEN:
+        _send_with_fallback(msg)
+    else:
+        # Split per baris agar tidak memotong di tengah kata/HTML tag
+        lines  = msg.split("\n")
+        chunk  = ""
+        part   = 1
+        for line in lines:
+            candidate = (chunk + "\n" + line) if chunk else line
+            if len(candidate) > MAX_LEN:
+                # Kirim chunk sekarang, mulai chunk baru
+                header = f"[{part}/…]\n" if part == 1 else f"[lanjutan {part}]\n"
+                _send_with_fallback(header + chunk)
+                time.sleep(0.5)   # jeda kecil antar part biar tidak kena rate limit
+                chunk = line
+                part += 1
+            else:
+                chunk = candidate
+        if chunk:
+            suffix = f" [{part}]" if part > 1 else ""
+            _send_with_fallback(chunk + (f"\n<i>— end{suffix} —</i>" if part > 1 else ""))
 
 
 def fmt_price(price: float) -> str:
